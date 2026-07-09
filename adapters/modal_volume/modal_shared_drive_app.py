@@ -2606,7 +2606,7 @@ def main(
         print(json.dumps(results, indent=2, sort_keys=True))
         return
 
-    if command == "prepare-archives":
+    if command in {"prepare-archives", "zip", "zip-mode"}:
         worker_indexes = [worker_index] if worker_index >= 0 else list(range(worker_count))
         calls = [
             prepare_archives_worker.spawn(

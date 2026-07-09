@@ -801,14 +801,17 @@ source Modal Volume -> prepared tar.zst/index files in cache Modal Volume
 cache Modal Volume -> Shared Drive drain, then remove local spool files after success
 ```
 
+This is the generic **zip mode** workflow; see `docs/zip-mode.md` for the target-agnostic explanation. In the Modal CLI, `zip`, `zip-mode`, and `prepare-archives` are equivalent archive-spool preparation commands.
+
 Use contiguous assignment for this workflow. The plan is sorted by source path, so contiguous worker slices preserve folder ranges better than modulo assignment.
 
 Prepare a limited archive spool:
 
 ```bash
 MODAL_MAX_CONTAINERS=10 \
+MODAL_CACHE_COMMIT_EVERY=25 \
 MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
-  scripts/run_modal_volume_adapter.sh prepare-archives \
+  scripts/run_modal_volume_adapter.sh zip \
   --plan-path plans/source-units.jsonl \
   --worker-count 10 \
   --assignment-mode contiguous \
