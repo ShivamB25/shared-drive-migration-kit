@@ -160,6 +160,99 @@ Set the active account if needed:
 gcloud config set account you@example.com
 ```
 
+## Agent-Friendly Naming And Bootstrap
+
+For future fully automated runs, assume the human has already completed:
+
+```bash
+gcloud auth login --enable-gdrive-access --force
+gcloud auth list
+gcloud organizations list
+gcloud billing accounts list
+```
+
+The agent should then infer safe defaults before asking questions.
+
+Discovery:
+
+```bash
+ACTIVE_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' | head -n 1)"
+ACCOUNT_DOMAIN="${ACTIVE_ACCOUNT#*@}"
+gcloud organizations list --format='table(displayName,name,domain,directoryCustomerId)'
+```
+
+Domain selection:
+
+1. Use the only organization domain if there is exactly one.
+2. Otherwise use the organization domain matching `ACCOUNT_DOMAIN`.
+3. If several domains are plausible, ask the human to choose.
+
+Suggested names:
+
+```bash
+WORKSPACE_DOMAIN="example.com"
+DOMAIN_SLUG="$(printf '%s' "$WORKSPACE_DOMAIN" | tr '[:upper:]' '[:lower:]' | tr '._' '--' | tr -cd 'a-z0-9-' | cut -c1-16)"
+RAND="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 5)"
+
+GOOGLE_CLOUD_PROJECT="sdmig-${DOMAIN_SLUG}-${RAND}"
+GROUP_EMAIL="drive-migration-uploaders@${WORKSPACE_DOMAIN}"
+GROUP_DISPLAY_NAME="Drive Migration Uploaders"
+SA_PREFIX="drive-migrate"
+RCLONE_REMOTE_PREFIX="gdrive-sa"
+```
+
+Naming rationale:
+
+- `sdmig-...` is short and leaves room for a random suffix under the 30-character project ID limit.
+- `drive-migration-uploaders@...` is explicit and reusable for the service-account group.
+- `drive-migrate-001` etc. are short enough for service-account IDs.
+- `gdrive-sa001:` etc. are compact rclone remote names.
+
+Agent behavior:
+
+- Ask the human for `SHARED_DRIVE_ID` if it is not already present.
+- Ask the human for `SOURCE_PATH` or run the relevant source adapter that creates it.
+- Prefer an unbilled dedicated project.
+- Do not link billing unless the human explicitly approves it.
+- Prefer CLI group creation with `scripts/create_google_group.sh`; fall back to manual group creation if permissions fail.
+- After creating or selecting names, update `.env` with placeholders replaced, never with tokens or JSON key contents.
+- Continue with preflight, service-account creation, group creation, group membership, shared-drive grant, rclone generation, and validation.
+
+Suggested `.env` update pattern:
+
+```bash
+cp -n .env.example .env
+
+python3 - <<'PY'
+from pathlib import Path
+
+updates = {
+    "GOOGLE_CLOUD_PROJECT": "sdmig-example-abc12",
+    "SA_PREFIX": "drive-migrate",
+    "SA_COUNT": "100",
+    "SHARED_DRIVE_ID": "0Axxxxxxxxxxxxxxxx",
+    "GROUP_EMAIL": "drive-migration-uploaders@example.com",
+    "GROUP_DISPLAY_NAME": "Drive Migration Uploaders",
+    "SOURCE_PATH": "/path/to/source-export",
+    "RCLONE_REMOTE_PREFIX": "gdrive-sa",
+}
+
+path = Path(".env")
+lines = path.read_text().splitlines()
+out = []
+for line in lines:
+    if "=" not in line or line.lstrip().startswith("#"):
+        out.append(line)
+        continue
+    key = line.split("=", 1)[0]
+    if key in updates:
+        out.append(f'{key}="{updates[key]}"')
+    else:
+        out.append(line)
+path.write_text("\n".join(out) + "\n")
+PY
+```
+
 ## Create A New Unbilled Migration Project
 
 List organization and billing context:

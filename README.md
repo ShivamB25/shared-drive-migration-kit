@@ -121,6 +121,95 @@ Primary references:
 
 ## Setup From Scratch
 
+### 0. Agent-Friendly Naming And Bootstrap
+
+For future automated runs, the human should first authenticate locally:
+
+```bash
+gcloud auth login --enable-gdrive-access --force
+gcloud auth list
+gcloud organizations list
+gcloud billing accounts list
+```
+
+After that, a coding agent can infer most safe defaults from the active account and organization list. The only values it normally still needs from the human are:
+
+- the destination `SHARED_DRIVE_ID`
+- the source adapter path, `SOURCE_PATH`
+- whether billing may be linked if organization policy blocks unbilled API enablement
+
+Suggested discovery commands:
+
+```bash
+ACTIVE_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' | head -n 1)"
+ACCOUNT_DOMAIN="${ACTIVE_ACCOUNT#*@}"
+gcloud organizations list --format='table(displayName,name,domain,directoryCustomerId)'
+```
+
+Pick the Workspace domain this way:
+
+1. If `gcloud organizations list` shows exactly one organization domain, use that.
+2. If one organization domain matches `ACCOUNT_DOMAIN`, use that.
+3. If there are multiple plausible domains, ask the human to choose.
+
+Suggested names:
+
+```bash
+WORKSPACE_DOMAIN="example.com"
+DOMAIN_SLUG="$(printf '%s' "$WORKSPACE_DOMAIN" | tr '[:upper:]' '[:lower:]' | tr '._' '--' | tr -cd 'a-z0-9-' | cut -c1-16)"
+RAND="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 5)"
+
+GOOGLE_CLOUD_PROJECT="sdmig-${DOMAIN_SLUG}-${RAND}"
+GROUP_EMAIL="drive-migration-uploaders@${WORKSPACE_DOMAIN}"
+GROUP_DISPLAY_NAME="Drive Migration Uploaders"
+SA_PREFIX="drive-migrate"
+RCLONE_REMOTE_PREFIX="gdrive-sa"
+```
+
+Why these names:
+
+- `sdmig-...` keeps the project ID short enough for Google Cloud's 30-character project ID limit.
+- `drive-migration-uploaders@...` describes the group purpose and is reusable for one shared-drive migration target.
+- `drive-migrate-001` through `drive-migrate-100` stay under the service-account ID length limit.
+- `gdrive-sa001:` through `gdrive-sa100:` are short rclone remote names.
+
+Suggested `.env` update flow for an agent:
+
+```bash
+cp -n .env.example .env
+
+python3 - <<'PY'
+from pathlib import Path
+
+updates = {
+    "GOOGLE_CLOUD_PROJECT": "sdmig-example-abc12",
+    "SA_PREFIX": "drive-migrate",
+    "SA_COUNT": "100",
+    "SHARED_DRIVE_ID": "0Axxxxxxxxxxxxxxxx",
+    "GROUP_EMAIL": "drive-migration-uploaders@example.com",
+    "GROUP_DISPLAY_NAME": "Drive Migration Uploaders",
+    "SOURCE_PATH": "/path/to/source-export",
+    "RCLONE_REMOTE_PREFIX": "gdrive-sa",
+}
+
+path = Path(".env")
+lines = path.read_text().splitlines()
+out = []
+for line in lines:
+    if "=" not in line or line.lstrip().startswith("#"):
+        out.append(line)
+        continue
+    key = line.split("=", 1)[0]
+    if key in updates:
+        out.append(f'{key}="{updates[key]}"')
+    else:
+        out.append(line)
+path.write_text("\n".join(out) + "\n")
+PY
+```
+
+Replace the example values before running that snippet. Do not write tokens, service-account JSON contents, or private keys into `.env`.
+
 ### 1. Login
 
 Login with Drive scope:
