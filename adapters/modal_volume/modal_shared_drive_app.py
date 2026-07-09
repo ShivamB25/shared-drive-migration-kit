@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import hashlib
 import json
@@ -8,6 +9,7 @@ import shlex
 import subprocess
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,9 @@ RCLONE_STATS = os.environ.get("RCLONE_STATS", "30s")
 RCLONE_STATS_FILE_NAME_LENGTH = os.environ.get("RCLONE_STATS_FILE_NAME_LENGTH", "0")
 RCLONE_LOG_LEVEL = os.environ.get("RCLONE_LOG_LEVEL", "INFO")
 RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT = os.environ.get("RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT", "1")
+MODAL_DISCOVER_THREADS = int(os.environ.get("MODAL_DISCOVER_THREADS", "16"))
+MODAL_DISCOVER_SHARD_DEPTH = int(os.environ.get("MODAL_DISCOVER_SHARD_DEPTH", "1"))
+MODAL_MOUNTED_FIND_THREADS = int(os.environ.get("MODAL_MOUNTED_FIND_THREADS", "16"))
 
 
 def env_int(name: str, default: int) -> int:
@@ -217,7 +222,7 @@ def summarize_unit_api(volume: modal.Volume, unit_path: str) -> tuple[int, int, 
     return files, dirs, bytes_total
 
 
-def write_api_plan_to_state(
+def write_api_plan_to_state_limited(
     source_volume_name: str,
     source_prefix: str,
     unit_depth: int,
@@ -296,6 +301,448 @@ def write_api_plan_to_state(
     return summary
 
 
+def relative_path_under_prefix(path: str, prefix: str) -> str:
+    clean_path = path.strip("/")
+    clean_prefix = prefix.strip("/")
+    if not clean_prefix:
+        return clean_path
+    if clean_path == clean_prefix:
+        return ""
+    prefix_with_slash = f"{clean_prefix}/"
+    if clean_path.startswith(prefix_with_slash):
+        return clean_path[len(prefix_with_slash) :]
+    return clean_path
+
+
+def inventory_path_for_plan(plan_path: str) -> str:
+    path = Path(clean_relative_path(plan_path))
+    return path.with_suffix(".inventory.jsonl").as_posix()
+
+
+def aggregate_unit_path(source_prefix: str, relative_to_source: str, unit_depth: int) -> str | None:
+    if unit_depth < 0:
+        raise ValueError("unit depth must be >= 0")
+    source = source_prefix.strip("/")
+    if unit_depth == 0:
+        return source
+    parts = [part for part in relative_to_source.strip("/").split("/") if part]
+    if len(parts) < unit_depth:
+        return None
+    return posix_join(source, *parts[:unit_depth])
+
+
+def mounted_unit_path(source_prefix: str, relative_to_source: str, unit_depth: int, is_dir: bool) -> str | None:
+    if unit_depth < 0:
+        raise ValueError("unit depth must be >= 0")
+    source = source_prefix.strip("/")
+    if unit_depth == 0:
+        return source
+    parts = [part for part in relative_to_source.strip("/").split("/") if part]
+    if is_dir and len(parts) >= unit_depth:
+        return posix_join(source, *parts[:unit_depth])
+    if not is_dir and len(parts) > unit_depth:
+        return posix_join(source, *parts[:unit_depth])
+    return None
+
+
+def discover_shard_prefixes_api(volume: modal.Volume, source_prefix: str, shard_depth: int) -> list[str]:
+    source = source_prefix.strip("/")
+    if shard_depth <= 0:
+        return [source]
+
+    frontier = [source]
+    for _depth in range(shard_depth):
+        next_frontier: list[str] = []
+        for current in frontier:
+            entries = volume.listdir(current or "/", recursive=False)
+            next_frontier.extend(sorted(entry.path.strip("/") for entry in entries if entry_is_dir(entry)))
+        frontier = next_frontier
+        if not frontier:
+            break
+    return frontier or [source]
+
+
+def scan_prefix_to_inventory(
+    source_volume_name: str,
+    scan_prefix: str,
+    source_prefix: str,
+    unit_depth: int,
+    inventory_path: Path,
+) -> dict[str, Any]:
+    volume = modal.Volume.from_name(source_volume_name)
+    units: dict[str, dict[str, int]] = {}
+    entries = 0
+    inventory_bytes = 0
+    source = source_prefix.strip("/")
+    started_at = time.time()
+
+    with inventory_path.open("w") as inventory_handle:
+        for entry in volume.listdir(scan_prefix or "/", recursive=True):
+            entry_path = entry.path.strip("/")
+            rel_to_source = relative_path_under_prefix(entry_path, source)
+            unit_path = aggregate_unit_path(source, rel_to_source, unit_depth)
+            entry_kind = entry_type_name(entry)
+            size = int(getattr(entry, "size", 0) or 0)
+            inventory_record = {
+                "path": entry_path,
+                "relative_path": rel_to_source,
+                "type": entry_kind,
+                "size": size,
+                "mtime": str(getattr(entry, "mtime", "")),
+                "unit_path": unit_path,
+            }
+            encoded = json.dumps(inventory_record, sort_keys=True)
+            inventory_handle.write(encoded + "\n")
+            inventory_bytes += len(encoded) + 1
+            entries += 1
+
+            if unit_path is not None:
+                unit = units.setdefault(unit_path, {"files": 0, "directories": 0, "bytes": 0})
+                if entry_is_file(entry):
+                    unit["files"] += 1
+                    unit["bytes"] += size
+                elif entry_is_dir(entry) and entry_path != unit_path:
+                    unit["directories"] += 1
+
+    return {
+        "scan_prefix": scan_prefix,
+        "entries": entries,
+        "inventory_bytes": inventory_bytes,
+        "units": units,
+        "elapsed_seconds": round(time.time() - started_at, 3),
+    }
+
+
+def write_sharded_api_plan_to_state(
+    source_volume_name: str,
+    source_prefix: str,
+    unit_depth: int,
+    dest_prefix: str,
+    plan_path: str,
+    max_package_bytes: str,
+    warn_package_bytes: str,
+    shard_depth: int,
+    threads: int,
+) -> dict[str, Any]:
+    volume = modal.Volume.from_name(source_volume_name)
+    state = modal.Volume.from_name(STATE_VOLUME_NAME, create_if_missing=True)
+    max_bytes = parse_bytes(max_package_bytes)
+    warn_bytes = parse_bytes(warn_package_bytes)
+    remote_plan_path = clean_relative_path(plan_path).as_posix()
+    remote_summary_path = str(Path(remote_plan_path).with_suffix(".summary.json"))
+    remote_inventory_path = inventory_path_for_plan(remote_plan_path)
+    started_at = time.time()
+
+    shard_prefixes = discover_shard_prefixes_api(volume, source_prefix, shard_depth)
+    worker_count = max(1, min(threads, len(shard_prefixes)))
+    print(
+        json.dumps(
+            {
+                "planner": "modal-volume-api-sharded",
+                "shards": len(shard_prefixes),
+                "threads": worker_count,
+                "shard_depth": shard_depth,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+    units: dict[str, dict[str, int]] = {}
+    total_entries = 0
+    inventory_bytes = 0
+    completed = 0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        inventory_dir = tmp_path / "inventory-shards"
+        inventory_dir.mkdir()
+        local_inventory = tmp_path / "inventory.jsonl"
+        local_plan = tmp_path / "plan.jsonl"
+        local_summary = tmp_path / "summary.json"
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    scan_prefix_to_inventory,
+                    source_volume_name,
+                    shard_prefix,
+                    source_prefix,
+                    unit_depth,
+                    inventory_dir / f"shard-{index:05d}.jsonl",
+                ): shard_prefix
+                for index, shard_prefix in enumerate(shard_prefixes)
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                total_entries += int(result["entries"])
+                inventory_bytes += int(result["inventory_bytes"])
+                for unit_path, unit_counts in result["units"].items():
+                    unit = units.setdefault(unit_path, {"files": 0, "directories": 0, "bytes": 0})
+                    unit["files"] += int(unit_counts["files"])
+                    unit["directories"] += int(unit_counts["directories"])
+                    unit["bytes"] += int(unit_counts["bytes"])
+
+                elapsed = max(time.time() - started_at, 0.001)
+                print(
+                    json.dumps(
+                        {
+                            "planner": "modal-volume-api-sharded",
+                            "completed_shards": completed,
+                            "shards": len(shard_prefixes),
+                            "latest_prefix": result["scan_prefix"],
+                            "entries": total_entries,
+                            "units": len(units),
+                            "entries_per_second": round(total_entries / elapsed, 2),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+
+        with local_inventory.open("w") as inventory_handle:
+            for shard_file in sorted(inventory_dir.glob("shard-*.jsonl")):
+                with shard_file.open() as shard_handle:
+                    for line in shard_handle:
+                        inventory_handle.write(line)
+
+        total_files = 0
+        total_dirs = 0
+        total_bytes = 0
+        strategy_counts: dict[str, int] = {}
+        with local_plan.open("w") as plan_handle:
+            for index, unit_path in enumerate(sorted(units)):
+                unit = units[unit_path]
+                files = int(unit["files"])
+                dirs = int(unit["directories"])
+                bytes_total = int(unit["bytes"])
+                archive_dest, package_index_dest, files_index_dest = target_paths(dest_prefix, unit_path)
+                strategy = package_strategy(bytes_total, max_bytes, warn_bytes)
+                row = {
+                    "index": index,
+                    "source_volume": source_volume_name,
+                    "source_path": unit_path,
+                    "archive_dest": archive_dest,
+                    "package_index_dest": package_index_dest,
+                    "files_index_dest": files_index_dest,
+                    "package_format": "tar.zst",
+                    "files": files,
+                    "directories": dirs,
+                    "bytes": bytes_total,
+                    "package_strategy": strategy,
+                    "max_package_bytes": max_bytes,
+                    "warn_package_bytes": warn_bytes,
+                    "planner": "modal-volume-api-sharded",
+                    "shard_depth": shard_depth,
+                }
+                plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+                total_files += files
+                total_dirs += dirs
+                total_bytes += bytes_total
+                strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
+
+        summary = {
+            "source_volume": source_volume_name,
+            "source_prefix": source_prefix,
+            "unit_depth": unit_depth,
+            "dest_prefix": dest_prefix,
+            "plan_path": f"/state/{remote_plan_path}",
+            "summary_path": f"/state/{remote_summary_path}",
+            "inventory_path": f"/state/{remote_inventory_path}",
+            "planner": "modal-volume-api-sharded",
+            "shard_depth": shard_depth,
+            "threads": worker_count,
+            "shards": len(shard_prefixes),
+            "entries": total_entries,
+            "inventory_bytes": inventory_bytes,
+            "units": len(units),
+            "files": total_files,
+            "directories": total_dirs,
+            "bytes": total_bytes,
+            "max_package_bytes": max_bytes,
+            "warn_package_bytes": warn_bytes,
+            "strategy_counts": strategy_counts,
+            "elapsed_seconds": round(time.time() - started_at, 3),
+        }
+        local_summary.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+
+        with state.batch_upload(force=True) as batch:
+            batch.put_file(local_plan, remote_plan_path)
+            batch.put_file(local_summary, remote_summary_path)
+            batch.put_file(local_inventory, remote_inventory_path)
+
+    return summary
+
+
+def write_api_plan_to_state(
+    source_volume_name: str,
+    source_prefix: str,
+    unit_depth: int,
+    dest_prefix: str,
+    plan_path: str,
+    limit: int,
+    max_package_bytes: str,
+    warn_package_bytes: str,
+) -> dict[str, Any]:
+    if limit > 0:
+        return write_api_plan_to_state_limited(
+            source_volume_name=source_volume_name,
+            source_prefix=source_prefix,
+            unit_depth=unit_depth,
+            dest_prefix=dest_prefix,
+            plan_path=plan_path,
+            limit=limit,
+            max_package_bytes=max_package_bytes,
+            warn_package_bytes=warn_package_bytes,
+        )
+    if MODAL_DISCOVER_THREADS > 1 and MODAL_DISCOVER_SHARD_DEPTH > 0 and MODAL_DISCOVER_SHARD_DEPTH < unit_depth:
+        return write_sharded_api_plan_to_state(
+            source_volume_name=source_volume_name,
+            source_prefix=source_prefix,
+            unit_depth=unit_depth,
+            dest_prefix=dest_prefix,
+            plan_path=plan_path,
+            max_package_bytes=max_package_bytes,
+            warn_package_bytes=warn_package_bytes,
+            shard_depth=MODAL_DISCOVER_SHARD_DEPTH,
+            threads=MODAL_DISCOVER_THREADS,
+        )
+
+    volume = modal.Volume.from_name(source_volume_name)
+    state = modal.Volume.from_name(STATE_VOLUME_NAME, create_if_missing=True)
+    max_bytes = parse_bytes(max_package_bytes)
+    warn_bytes = parse_bytes(warn_package_bytes)
+    source = source_prefix.strip("/")
+    remote_plan_path = clean_relative_path(plan_path).as_posix()
+    remote_summary_path = str(Path(remote_plan_path).with_suffix(".summary.json"))
+    remote_inventory_path = inventory_path_for_plan(remote_plan_path)
+
+    units: dict[str, dict[str, Any]] = {}
+    total_entries = 0
+    inventory_bytes = 0
+    started_at = time.time()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        local_inventory = tmp_path / "inventory.jsonl"
+        local_plan = tmp_path / "plan.jsonl"
+        local_summary = tmp_path / "summary.json"
+
+        with local_inventory.open("w") as inventory_handle:
+            for entry in volume.listdir(source or "/", recursive=True):
+                entry_path = entry.path.strip("/")
+                rel_to_source = relative_path_under_prefix(entry_path, source)
+                unit_path = aggregate_unit_path(source, rel_to_source, unit_depth)
+                entry_kind = entry_type_name(entry)
+                size = int(getattr(entry, "size", 0) or 0)
+                inventory_record = {
+                    "path": entry_path,
+                    "relative_path": rel_to_source,
+                    "type": entry_kind,
+                    "size": size,
+                    "mtime": str(getattr(entry, "mtime", "")),
+                    "unit_path": unit_path,
+                }
+                encoded = json.dumps(inventory_record, sort_keys=True)
+                inventory_handle.write(encoded + "\n")
+                inventory_bytes += len(encoded) + 1
+                total_entries += 1
+
+                if unit_path is not None:
+                    unit = units.setdefault(
+                        unit_path,
+                        {
+                            "files": 0,
+                            "directories": 0,
+                            "bytes": 0,
+                        },
+                    )
+                    if entry_is_file(entry):
+                        unit["files"] += 1
+                        unit["bytes"] += size
+                    elif entry_is_dir(entry) and entry_path != unit_path:
+                        unit["directories"] += 1
+
+                if total_entries % 100000 == 0:
+                    elapsed = max(time.time() - started_at, 0.001)
+                    print(
+                        json.dumps(
+                            {
+                                "planner": "modal-volume-api-single-pass",
+                                "entries": total_entries,
+                                "units": len(units),
+                                "entries_per_second": round(total_entries / elapsed, 2),
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+
+        total_files = 0
+        total_dirs = 0
+        total_bytes = 0
+        strategy_counts: dict[str, int] = {}
+        with local_plan.open("w") as plan_handle:
+            for index, unit_path in enumerate(sorted(units)):
+                unit = units[unit_path]
+                files = int(unit["files"])
+                dirs = int(unit["directories"])
+                bytes_total = int(unit["bytes"])
+                archive_dest, package_index_dest, files_index_dest = target_paths(dest_prefix, unit_path)
+                strategy = package_strategy(bytes_total, max_bytes, warn_bytes)
+                row = {
+                    "index": index,
+                    "source_volume": source_volume_name,
+                    "source_path": unit_path,
+                    "archive_dest": archive_dest,
+                    "package_index_dest": package_index_dest,
+                    "files_index_dest": files_index_dest,
+                    "package_format": "tar.zst",
+                    "files": files,
+                    "directories": dirs,
+                    "bytes": bytes_total,
+                    "package_strategy": strategy,
+                    "max_package_bytes": max_bytes,
+                    "warn_package_bytes": warn_bytes,
+                    "planner": "modal-volume-api-single-pass",
+                }
+                plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+                total_files += files
+                total_dirs += dirs
+                total_bytes += bytes_total
+                strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
+
+        summary = {
+            "source_volume": source_volume_name,
+            "source_prefix": source_prefix,
+            "unit_depth": unit_depth,
+            "dest_prefix": dest_prefix,
+            "plan_path": f"/state/{remote_plan_path}",
+            "summary_path": f"/state/{remote_summary_path}",
+            "inventory_path": f"/state/{remote_inventory_path}",
+            "planner": "modal-volume-api-single-pass",
+            "entries": total_entries,
+            "inventory_bytes": inventory_bytes,
+            "units": len(units),
+            "files": total_files,
+            "directories": total_dirs,
+            "bytes": total_bytes,
+            "max_package_bytes": max_bytes,
+            "warn_package_bytes": warn_bytes,
+            "strategy_counts": strategy_counts,
+            "elapsed_seconds": round(time.time() - started_at, 3),
+        }
+        local_summary.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+
+        with state.batch_upload(force=True) as batch:
+            batch.put_file(local_plan, remote_plan_path)
+            batch.put_file(local_summary, remote_summary_path)
+            batch.put_file(local_inventory, remote_inventory_path)
+
+    return summary
+
+
 def unit_name_for(unit_rel: str) -> str:
     return unit_rel.rstrip("/").split("/")[-1]
 
@@ -308,6 +755,730 @@ def target_paths(dest_prefix: str, unit_rel: str) -> tuple[str, str, str]:
     package_index = "/".join([unit_prefix, f"{unit_name}.package.index.json"])
     files_index = "/".join([unit_prefix, f"{unit_name}.files.index.jsonl.zst"])
     return archive, package_index, files_index
+
+
+def raw_dest_path(dest_prefix: str, source_rel: str) -> str:
+    return "/".join(part for part in [dest_prefix.strip("/"), source_rel.strip("/")] if part)
+
+
+def scan_api_stream(
+    source_volume_name: str,
+    source_prefix: str,
+    unit_depth: int,
+    dest_prefix: str,
+    plan_path: str,
+    max_package_bytes: str,
+    warn_package_bytes: str,
+    local_plan: Path,
+    local_summary: Path,
+    local_inventory: Path,
+) -> dict[str, Any]:
+    volume = modal.Volume.from_name(source_volume_name)
+    max_bytes = parse_bytes(max_package_bytes)
+    warn_bytes = parse_bytes(warn_package_bytes)
+    source = source_prefix.strip("/")
+    remote_plan_path = clean_relative_path(plan_path).as_posix()
+    remote_summary_path = str(Path(remote_plan_path).with_suffix(".summary.json"))
+    remote_inventory_path = inventory_path_for_plan(remote_plan_path)
+
+    units: dict[str, dict[str, int]] = {}
+    raw_files: list[dict[str, Any]] = []
+    entries = 0
+    files = 0
+    dirs = 0
+    bytes_total = 0
+    started_at = time.time()
+
+    with local_inventory.open("w") as inventory_handle:
+        for entry in volume.iterdir(source or "/", recursive=True):
+            source_path = entry.path.strip("/")
+            rel_to_source = relative_path_under_prefix(source_path, source)
+            kind_name = entry_type_name(entry)
+            is_file = entry_is_file(entry)
+            is_dir = entry_is_dir(entry)
+            size = int(getattr(entry, "size", 0) or 0)
+            unit_path = mounted_unit_path(source, rel_to_source, unit_depth, is_dir)
+            inventory_record = {
+                "path": source_path,
+                "relative_path": rel_to_source,
+                "type": kind_name,
+                "size": size if is_file else 0,
+                "mtime": str(getattr(entry, "mtime", "")),
+                "unit_path": unit_path,
+            }
+            inventory_handle.write(json.dumps(inventory_record, sort_keys=True) + "\n")
+
+            entries += 1
+            if is_file:
+                files += 1
+                bytes_total += size
+            elif is_dir:
+                dirs += 1
+
+            if unit_path is None:
+                if is_file:
+                    raw_files.append(
+                        {
+                            "source_path": source_path,
+                            "dest_path": raw_dest_path(dest_prefix, source_path),
+                            "bytes": size,
+                            "mtime": str(getattr(entry, "mtime", "")),
+                        }
+                    )
+            else:
+                unit = units.setdefault(unit_path, {"files": 0, "directories": 0, "bytes": 0})
+                if is_file:
+                    unit["files"] += 1
+                    unit["bytes"] += size
+                elif is_dir and source_path != unit_path:
+                    unit["directories"] += 1
+
+            if entries % 100000 == 0:
+                elapsed = max(time.time() - started_at, 0.001)
+                print(
+                    json.dumps(
+                        {
+                            "planner": "modal-volume-api-stream",
+                            "entries": entries,
+                            "files": files,
+                            "directories": dirs,
+                            "units": len(units),
+                            "raw_files": len(raw_files),
+                            "entries_per_second": round(entries / elapsed, 2),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+
+    total_package_files = 0
+    total_package_dirs = 0
+    total_package_bytes = 0
+    strategy_counts: dict[str, int] = {}
+    rows = 0
+    with local_plan.open("w") as plan_handle:
+        for raw_index, raw_file in enumerate(sorted(raw_files, key=lambda item: item["source_path"])):
+            row = {
+                "index": rows,
+                "kind": "raw_file",
+                "source_volume": source_volume_name,
+                "source_path": raw_file["source_path"],
+                "dest_path": raw_file["dest_path"],
+                "archive_dest": raw_file["dest_path"],
+                "package_format": "raw",
+                "files": 1,
+                "directories": 0,
+                "bytes": raw_file["bytes"],
+                "planner": "modal-volume-api-stream",
+                "raw_index": raw_index,
+            }
+            plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+            rows += 1
+
+        for unit_path in sorted(units):
+            unit = units[unit_path]
+            unit_files = int(unit["files"])
+            unit_dirs = int(unit["directories"])
+            unit_bytes = int(unit["bytes"])
+            archive_dest, package_index_dest, files_index_dest = target_paths(dest_prefix, unit_path)
+            strategy = package_strategy(unit_bytes, max_bytes, warn_bytes)
+            row = {
+                "index": rows,
+                "kind": "package",
+                "source_volume": source_volume_name,
+                "source_path": unit_path,
+                "archive_dest": archive_dest,
+                "package_index_dest": package_index_dest,
+                "files_index_dest": files_index_dest,
+                "package_format": "tar.zst",
+                "files": unit_files,
+                "directories": unit_dirs,
+                "bytes": unit_bytes,
+                "package_strategy": strategy,
+                "max_package_bytes": max_bytes,
+                "warn_package_bytes": warn_bytes,
+                "planner": "modal-volume-api-stream",
+            }
+            plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+            rows += 1
+            total_package_files += unit_files
+            total_package_dirs += unit_dirs
+            total_package_bytes += unit_bytes
+            strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
+
+    summary = {
+        "source_volume": source_volume_name,
+        "source_prefix": source_prefix,
+        "unit_depth": unit_depth,
+        "dest_prefix": dest_prefix,
+        "plan_path": f"/state/{remote_plan_path}",
+        "summary_path": f"/state/{remote_summary_path}",
+        "inventory_path": f"/state/{remote_inventory_path}",
+        "planner": "modal-volume-api-stream",
+        "entries": entries,
+        "files": files,
+        "directories": dirs,
+        "bytes": bytes_total,
+        "package_rows": len(units),
+        "raw_file_rows": len(raw_files),
+        "plan_rows": rows,
+        "package_files": total_package_files,
+        "package_directories": total_package_dirs,
+        "package_bytes": total_package_bytes,
+        "max_package_bytes": max_bytes,
+        "warn_package_bytes": warn_bytes,
+        "strategy_counts": strategy_counts,
+        "elapsed_seconds": round(time.time() - started_at, 3),
+    }
+    local_summary.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    return summary
+
+
+def write_api_stream_plan_to_state(
+    source_volume_name: str,
+    source_prefix: str,
+    unit_depth: int,
+    dest_prefix: str,
+    plan_path: str,
+    max_package_bytes: str,
+    warn_package_bytes: str,
+) -> dict[str, Any]:
+    state = modal.Volume.from_name(STATE_VOLUME_NAME, create_if_missing=True)
+    remote_plan_path = clean_relative_path(plan_path).as_posix()
+    remote_summary_path = str(Path(remote_plan_path).with_suffix(".summary.json"))
+    remote_inventory_path = inventory_path_for_plan(remote_plan_path)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        local_plan = tmp_path / "plan.jsonl"
+        local_summary = tmp_path / "summary.json"
+        local_inventory = tmp_path / "inventory.jsonl"
+        summary = scan_api_stream(
+            source_volume_name,
+            source_prefix,
+            unit_depth,
+            dest_prefix,
+            plan_path,
+            max_package_bytes,
+            warn_package_bytes,
+            local_plan,
+            local_summary,
+            local_inventory,
+        )
+        with state.batch_upload(force=True) as batch:
+            batch.put_file(local_plan, remote_plan_path)
+            batch.put_file(local_summary, remote_summary_path)
+            batch.put_file(local_inventory, remote_inventory_path)
+    return summary
+
+
+def write_structure_plan_to_state(
+    source_volume_name: str,
+    source_prefix: str,
+    unit_depth: int,
+    dest_prefix: str,
+    plan_path: str,
+    max_package_bytes: str,
+    warn_package_bytes: str,
+) -> dict[str, Any]:
+    volume = modal.Volume.from_name(source_volume_name)
+    state = modal.Volume.from_name(STATE_VOLUME_NAME, create_if_missing=True)
+    max_bytes = parse_bytes(max_package_bytes)
+    warn_bytes = parse_bytes(warn_package_bytes)
+    source = source_prefix.strip("/")
+    remote_plan_path = clean_relative_path(plan_path).as_posix()
+    remote_summary_path = str(Path(remote_plan_path).with_suffix(".summary.json"))
+
+    raw_files: list[dict[str, Any]] = []
+    package_units: list[str] = []
+    listed_dirs = 0
+    started_at = time.time()
+
+    frontier: list[tuple[str, int]] = [(source, 0)]
+    while frontier:
+        current, depth = frontier.pop(0)
+        listed_dirs += 1
+        for entry in volume.listdir(current or "/", recursive=False):
+            entry_path = entry.path.strip("/")
+            if entry_is_file(entry):
+                raw_files.append(
+                    {
+                        "source_path": entry_path,
+                        "dest_path": raw_dest_path(dest_prefix, entry_path),
+                        "bytes": int(getattr(entry, "size", 0) or 0),
+                        "mtime": str(getattr(entry, "mtime", "")),
+                    }
+                )
+            elif entry_is_dir(entry):
+                next_depth = depth + 1
+                if next_depth == unit_depth:
+                    package_units.append(entry_path)
+                elif next_depth < unit_depth:
+                    frontier.append((entry_path, next_depth))
+
+        if listed_dirs % 100 == 0:
+            elapsed = max(time.time() - started_at, 0.001)
+            print(
+                json.dumps(
+                    {
+                        "planner": "modal-volume-structure",
+                        "listed_dirs": listed_dirs,
+                        "frontier": len(frontier),
+                        "package_units": len(package_units),
+                        "raw_files": len(raw_files),
+                        "listings_per_second": round(listed_dirs / elapsed, 2),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        local_plan = tmp_path / "plan.jsonl"
+        local_summary = tmp_path / "summary.json"
+
+        rows = 0
+        raw_bytes = 0
+        with local_plan.open("w") as plan_handle:
+            for raw_index, raw_file in enumerate(sorted(raw_files, key=lambda item: item["source_path"])):
+                row = {
+                    "index": rows,
+                    "kind": "raw_file",
+                    "source_volume": source_volume_name,
+                    "source_path": raw_file["source_path"],
+                    "dest_path": raw_file["dest_path"],
+                    "archive_dest": raw_file["dest_path"],
+                    "package_format": "raw",
+                    "files": 1,
+                    "directories": 0,
+                    "bytes": raw_file["bytes"],
+                    "planner": "modal-volume-structure",
+                    "raw_index": raw_index,
+                }
+                plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+                rows += 1
+                raw_bytes += int(raw_file["bytes"])
+
+            for unit_path in sorted(package_units):
+                archive_dest, package_index_dest, files_index_dest = target_paths(dest_prefix, unit_path)
+                row = {
+                    "index": rows,
+                    "kind": "package",
+                    "source_volume": source_volume_name,
+                    "source_path": unit_path,
+                    "archive_dest": archive_dest,
+                    "package_index_dest": package_index_dest,
+                    "files_index_dest": files_index_dest,
+                    "package_format": "tar.zst",
+                    "files": None,
+                    "directories": None,
+                    "bytes": None,
+                    "package_strategy": "worker_index_required",
+                    "max_package_bytes": max_bytes,
+                    "warn_package_bytes": warn_bytes,
+                    "planner": "modal-volume-structure",
+                }
+                plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+                rows += 1
+
+        summary = {
+            "source_volume": source_volume_name,
+            "source_prefix": source_prefix,
+            "unit_depth": unit_depth,
+            "dest_prefix": dest_prefix,
+            "plan_path": f"/state/{remote_plan_path}",
+            "summary_path": f"/state/{remote_summary_path}",
+            "planner": "modal-volume-structure",
+            "listed_dirs": listed_dirs,
+            "package_rows": len(package_units),
+            "raw_file_rows": len(raw_files),
+            "raw_bytes": raw_bytes,
+            "plan_rows": rows,
+            "max_package_bytes": max_bytes,
+            "warn_package_bytes": warn_bytes,
+            "elapsed_seconds": round(time.time() - started_at, 3),
+            "note": "Package byte/file counts are computed by upload workers before archiving.",
+        }
+        local_summary.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+
+        with state.batch_upload(force=True) as batch:
+            batch.put_file(local_plan, remote_plan_path)
+            batch.put_file(local_summary, remote_summary_path)
+
+    return summary
+
+
+def iter_find_records(find_root: Path) -> Iterator[tuple[str, int, str, str]]:
+    command = ["find", str(find_root), "-mindepth", "1", "-printf", "%y\\0%s\\0%T@\\0%P\\0"]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert process.stdout is not None
+
+    buffer = b""
+    fields: list[bytes] = []
+    while True:
+        chunk = process.stdout.read(1024 * 1024)
+        if not chunk:
+            break
+        buffer += chunk
+        parts = buffer.split(b"\0")
+        buffer = parts.pop()
+        for part in parts:
+            fields.append(part)
+            if len(fields) == 4:
+                kind = fields[0].decode("utf-8", errors="surrogateescape")
+                size_text = fields[1].decode("ascii", errors="ignore") or "0"
+                mtime = fields[2].decode("ascii", errors="ignore")
+                rel_path = fields[3].decode("utf-8", errors="surrogateescape")
+                fields = []
+                yield kind, int(size_text), mtime, rel_path
+
+    stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(f"find failed with exit {return_code}: {stderr.strip()}")
+    if buffer or fields:
+        raise RuntimeError("find output ended with a partial record")
+
+
+def find_kind_name(kind: str) -> str:
+    return {
+        "d": "DIRECTORY",
+        "f": "FILE",
+        "l": "SYMLINK",
+    }.get(kind, "OTHER")
+
+
+def mounted_scan_roots(find_root: Path, source: str) -> tuple[list[Path], list[Path]]:
+    if source:
+        return [find_root], []
+    scan_dirs: list[Path] = []
+    shallow_files: list[Path] = []
+    for entry in sorted(find_root.iterdir(), key=lambda path: path.name):
+        if entry.is_dir():
+            scan_dirs.append(entry)
+        elif entry.is_file():
+            shallow_files.append(entry)
+    return scan_dirs, shallow_files
+
+
+def scan_mounted_dir_to_inventory(
+    scan_dir: Path,
+    scan_source: str,
+    source: str,
+    unit_depth: int,
+    dest_prefix: str,
+    inventory_path: Path,
+) -> dict[str, Any]:
+    units: dict[str, dict[str, int]] = {}
+    raw_files: list[dict[str, Any]] = []
+    entries = 0
+    files = 0
+    dirs = 0
+    bytes_total = 0
+    started_at = time.time()
+
+    with inventory_path.open("w") as inventory_handle:
+        for kind, size, mtime, rel_under_scan in iter_find_records(scan_dir):
+            source_path = posix_join(scan_source, rel_under_scan)
+            rel_to_source = relative_path_under_prefix(source_path, source)
+            kind_name = find_kind_name(kind)
+            is_file = kind == "f"
+            is_dir = kind == "d"
+            unit_path = mounted_unit_path(source, rel_to_source, unit_depth, is_dir)
+
+            inventory_record = {
+                "path": source_path,
+                "relative_path": rel_to_source,
+                "type": kind_name,
+                "size": size if is_file else 0,
+                "mtime": mtime,
+                "unit_path": unit_path,
+            }
+            inventory_handle.write(json.dumps(inventory_record, sort_keys=True) + "\n")
+
+            entries += 1
+            if is_file:
+                files += 1
+                bytes_total += size
+            elif is_dir:
+                dirs += 1
+
+            if unit_path is None:
+                if is_file:
+                    raw_files.append(
+                        {
+                            "source_path": source_path,
+                            "dest_path": raw_dest_path(dest_prefix, source_path),
+                            "bytes": size,
+                            "mtime": mtime,
+                        }
+                    )
+            else:
+                unit = units.setdefault(unit_path, {"files": 0, "directories": 0, "bytes": 0})
+                if is_file:
+                    unit["files"] += 1
+                    unit["bytes"] += size
+                elif is_dir and source_path != unit_path:
+                    unit["directories"] += 1
+
+    return {
+        "scan_prefix": scan_source,
+        "entries": entries,
+        "files": files,
+        "directories": dirs,
+        "bytes": bytes_total,
+        "units": units,
+        "raw_files": raw_files,
+        "elapsed_seconds": round(time.time() - started_at, 3),
+    }
+
+
+@app.function(
+    image=image,
+    volumes={str(SOURCE_MOUNT): source_volume, str(STATE_MOUNT): state_volume},
+    timeout=env_int("MODAL_TIMEOUT", 43200),
+    cpu=float(os.environ.get("MODAL_CPU", "2")),
+    memory=env_int("MODAL_MEMORY", 4096),
+    ephemeral_disk=env_int("MODAL_EPHEMERAL_DISK", 524288),
+    max_containers=1,
+)
+def discover_units_mounted_find(
+    source_prefix: str = "",
+    source_volume_name: str = SOURCE_VOLUME_NAME,
+    unit_depth: int = 2,
+    dest_prefix: str = "",
+    plan_path: str = "plans/modal-volume-units.jsonl",
+    max_package_bytes: str = "700GiB",
+    warn_package_bytes: str = "650GiB",
+) -> dict[str, Any]:
+    source_rel = clean_relative_path(source_prefix)
+    find_root = SOURCE_MOUNT / source_rel
+    ensure_inside(find_root, SOURCE_MOUNT)
+    if not find_root.exists() or not find_root.is_dir():
+        raise FileNotFoundError(f"source prefix does not exist or is not a directory: {find_root}")
+
+    max_bytes = parse_bytes(max_package_bytes)
+    warn_bytes = parse_bytes(warn_package_bytes)
+    remote_plan_path = clean_relative_path(plan_path).as_posix()
+    remote_summary_path = str(Path(remote_plan_path).with_suffix(".summary.json"))
+    remote_inventory_path = inventory_path_for_plan(remote_plan_path)
+
+    units: dict[str, dict[str, int]] = {}
+    raw_files: list[dict[str, Any]] = []
+    entries = 0
+    files = 0
+    dirs = 0
+    bytes_total = 0
+    started_at = time.time()
+
+    output = STATE_MOUNT / remote_plan_path
+    inventory = STATE_MOUNT / remote_inventory_path
+    summary_path = STATE_MOUNT / remote_summary_path
+    output.parent.mkdir(parents=True, exist_ok=True)
+    inventory.parent.mkdir(parents=True, exist_ok=True)
+
+    source = source_prefix.strip("/")
+    scan_dirs, shallow_files = mounted_scan_roots(find_root, source)
+    print(
+        json.dumps(
+            {
+                "planner": "modal-volume-mounted-find",
+                "scan_dirs": len(scan_dirs),
+                "shallow_files": len(shallow_files),
+                "source_prefix": source_prefix,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    shallow_inventory_records: list[str] = []
+    for shallow_file in shallow_files:
+        stat = shallow_file.stat()
+        rel_to_source = shallow_file.relative_to(find_root).as_posix()
+        source_path = posix_join(source, rel_to_source)
+        inventory_record = {
+            "path": source_path,
+            "relative_path": rel_to_source,
+            "type": "FILE",
+            "size": stat.st_size,
+            "mtime": str(stat.st_mtime),
+            "unit_path": None,
+        }
+        shallow_inventory_records.append(json.dumps(inventory_record, sort_keys=True) + "\n")
+        raw_files.append(
+            {
+                "source_path": source_path,
+                "dest_path": raw_dest_path(dest_prefix, source_path),
+                "bytes": stat.st_size,
+                "mtime": str(stat.st_mtime),
+            }
+        )
+        entries += 1
+        files += 1
+        bytes_total += stat.st_size
+
+    worker_count = max(1, min(MODAL_MOUNTED_FIND_THREADS, len(scan_dirs)))
+    with tempfile.TemporaryDirectory() as tmp:
+        shard_dir = Path(tmp) / "mounted-find-shards"
+        shard_dir.mkdir()
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {}
+            for index, scan_dir in enumerate(scan_dirs):
+                scan_source = posix_join(source, scan_dir.relative_to(find_root).as_posix()) if not source else source
+                print(
+                    json.dumps(
+                        {
+                            "planner": "modal-volume-mounted-find",
+                            "scan_prefix": scan_source,
+                            "status": "queued",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                futures[
+                    executor.submit(
+                        scan_mounted_dir_to_inventory,
+                        scan_dir,
+                        scan_source,
+                        source,
+                        unit_depth,
+                        dest_prefix,
+                        shard_dir / f"shard-{index:05d}.jsonl",
+                    )
+                ] = scan_source
+
+            completed = 0
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                entries += int(result["entries"])
+                files += int(result["files"])
+                dirs += int(result["directories"])
+                bytes_total += int(result["bytes"])
+                raw_files.extend(result["raw_files"])
+                for unit_path, unit_counts in result["units"].items():
+                    unit = units.setdefault(unit_path, {"files": 0, "directories": 0, "bytes": 0})
+                    unit["files"] += int(unit_counts["files"])
+                    unit["directories"] += int(unit_counts["directories"])
+                    unit["bytes"] += int(unit_counts["bytes"])
+
+                elapsed = max(time.time() - started_at, 0.001)
+                print(
+                    json.dumps(
+                        {
+                            "planner": "modal-volume-mounted-find",
+                            "completed_prefixes": completed,
+                            "scan_dirs": len(scan_dirs),
+                            "scan_prefix": result["scan_prefix"],
+                            "status": "finished",
+                            "prefix_entries": result["entries"],
+                            "prefix_entries_per_second": round(
+                                int(result["entries"]) / max(float(result["elapsed_seconds"]), 0.001),
+                                2,
+                            ),
+                            "entries": entries,
+                            "files": files,
+                            "directories": dirs,
+                            "units": len(units),
+                            "raw_files": len(raw_files),
+                            "entries_per_second": round(entries / elapsed, 2),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+
+        with inventory.open("w") as inventory_handle:
+            inventory_handle.writelines(shallow_inventory_records)
+            for shard_file in sorted(shard_dir.glob("shard-*.jsonl")):
+                with shard_file.open() as shard_handle:
+                    for line in shard_handle:
+                        inventory_handle.write(line)
+
+    total_package_files = 0
+    total_package_dirs = 0
+    total_package_bytes = 0
+    strategy_counts: dict[str, int] = {}
+    rows = 0
+    with output.open("w") as plan_handle:
+        for raw_index, raw_file in enumerate(sorted(raw_files, key=lambda item: item["source_path"])):
+            row = {
+                "index": rows,
+                "kind": "raw_file",
+                "source_volume": source_volume_name,
+                "source_path": raw_file["source_path"],
+                "dest_path": raw_file["dest_path"],
+                "archive_dest": raw_file["dest_path"],
+                "package_format": "raw",
+                "files": 1,
+                "directories": 0,
+                "bytes": raw_file["bytes"],
+                "planner": "modal-volume-mounted-find",
+                "raw_index": raw_index,
+            }
+            plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+            rows += 1
+
+        for unit_path in sorted(units):
+            unit = units[unit_path]
+            unit_files = int(unit["files"])
+            unit_dirs = int(unit["directories"])
+            unit_bytes = int(unit["bytes"])
+            archive_dest, package_index_dest, files_index_dest = target_paths(dest_prefix, unit_path)
+            strategy = package_strategy(unit_bytes, max_bytes, warn_bytes)
+            row = {
+                "index": rows,
+                "kind": "package",
+                "source_volume": source_volume_name,
+                "source_path": unit_path,
+                "archive_dest": archive_dest,
+                "package_index_dest": package_index_dest,
+                "files_index_dest": files_index_dest,
+                "package_format": "tar.zst",
+                "files": unit_files,
+                "directories": unit_dirs,
+                "bytes": unit_bytes,
+                "package_strategy": strategy,
+                "max_package_bytes": max_bytes,
+                "warn_package_bytes": warn_bytes,
+                "planner": "modal-volume-mounted-find",
+            }
+            plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+            rows += 1
+            total_package_files += unit_files
+            total_package_dirs += unit_dirs
+            total_package_bytes += unit_bytes
+            strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
+
+    summary = {
+        "source_volume": source_volume_name,
+        "source_prefix": source_prefix,
+        "unit_depth": unit_depth,
+        "dest_prefix": dest_prefix,
+        "plan_path": str(output),
+        "summary_path": str(summary_path),
+        "inventory_path": str(inventory),
+        "planner": "modal-volume-mounted-find",
+        "entries": entries,
+        "files": files,
+        "directories": dirs,
+        "bytes": bytes_total,
+        "package_rows": len(units),
+        "raw_file_rows": len(raw_files),
+        "plan_rows": rows,
+        "package_files": total_package_files,
+        "package_directories": total_package_dirs,
+        "package_bytes": total_package_bytes,
+        "max_package_bytes": max_bytes,
+        "warn_package_bytes": warn_bytes,
+        "strategy_counts": strategy_counts,
+        "elapsed_seconds": round(time.time() - started_at, 3),
+    }
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    state_volume.commit()
+    return summary
 
 
 def load_remotes(worker_index: int, remote_group_size: int) -> list[str]:
@@ -808,6 +1979,7 @@ def upload_worker(
             if row_index % worker_count != worker_index:
                 continue
             remote = remotes[processed % len(remotes)]
+            row_kind = row.get("kind", "package")
             unit_rel = row["source_path"]
             unit_abs = SOURCE_MOUNT / clean_relative_path(unit_rel)
             archive_dest = row["archive_dest"]
@@ -821,12 +1993,30 @@ def upload_worker(
                 "archive_dest": archive_dest,
                 "package_index_dest": package_index_dest,
                 "files_index_dest": files_index_dest,
+                "kind": row_kind,
                 "dry_run": dry_run,
                 "upload_mode": upload_mode,
                 "started_at_unix": int(time.time()),
             }
             try:
                 ensure_inside(unit_abs, SOURCE_MOUNT)
+                if row_kind == "raw_file":
+                    if not unit_abs.exists() or not unit_abs.is_file():
+                        raise FileNotFoundError(f"missing raw source file: {unit_abs}")
+                    result["bytes"] = row.get("bytes", unit_abs.stat().st_size)
+                    if dry_run:
+                        result["status"] = "planned"
+                    else:
+                        rclone_copyto(remote, row.get("dest_path", archive_dest), unit_abs)
+                        result["status"] = "uploaded"
+                        uploaded += 1
+                    status_handle.write(json.dumps(result | {"finished_at_unix": int(time.time())}, sort_keys=True) + "\n")
+                    status_handle.flush()
+                    processed += 1
+                    if limit > 0 and processed >= limit:
+                        break
+                    continue
+
                 if not unit_abs.exists() or not unit_abs.is_dir():
                     raise FileNotFoundError(f"missing source package directory: {unit_abs}")
                 if dry_run:
@@ -943,6 +2133,45 @@ def main(
             plan_path=plan_path,
             limit=limit,
             include_stats=include_stats,
+            max_package_bytes=max_package_bytes,
+            warn_package_bytes=warn_package_bytes,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+
+    if command == "discover-mounted-fast":
+        result = discover_units_mounted_find.remote(
+            source_prefix=source_prefix,
+            source_volume_name=SOURCE_VOLUME_NAME,
+            unit_depth=unit_depth,
+            dest_prefix=dest_prefix,
+            plan_path=plan_path,
+            max_package_bytes=max_package_bytes,
+            warn_package_bytes=warn_package_bytes,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+
+    if command == "discover-api-stream":
+        result = write_api_stream_plan_to_state(
+            source_volume_name=SOURCE_VOLUME_NAME,
+            source_prefix=source_prefix,
+            unit_depth=unit_depth,
+            dest_prefix=dest_prefix,
+            plan_path=plan_path,
+            max_package_bytes=max_package_bytes,
+            warn_package_bytes=warn_package_bytes,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+
+    if command == "discover-structure":
+        result = write_structure_plan_to_state(
+            source_volume_name=SOURCE_VOLUME_NAME,
+            source_prefix=source_prefix,
+            unit_depth=unit_depth,
+            dest_prefix=dest_prefix,
+            plan_path=plan_path,
             max_package_bytes=max_package_bytes,
             warn_package_bytes=warn_package_bytes,
         )
