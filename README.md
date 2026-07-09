@@ -783,10 +783,13 @@ For very large source volumes, prefer a two-phase archive spool when Drive is un
 
 The source volume remains read-only. The cache volume must have enough capacity for the prepared archives. For a 72 TiB source, this can require tens of TiB of Modal Volume storage even with zstd compression, so start with small limits and inspect `/state/runs/prepare-worker-...` before scaling.
 
+`MODAL_CACHE_COMMIT_EVERY` controls how often prepared files are committed to the cache volume. Larger values reduce Modal Volume commit overhead and are faster; smaller values reduce the amount of work that may need to be repeated if a worker is interrupted before its next commit.
+
 Prepare archives into the cache volume without touching Drive:
 
 ```bash
 MODAL_MAX_CONTAINERS=10 \
+MODAL_CACHE_COMMIT_EVERY=25 \
 MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
   scripts/run_modal_volume_adapter.sh prepare-archives \
   --plan-path plans/source-units.jsonl \

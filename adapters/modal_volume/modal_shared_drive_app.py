@@ -46,6 +46,7 @@ RCLONE_STATS_FILE_NAME_LENGTH = os.environ.get("RCLONE_STATS_FILE_NAME_LENGTH", 
 RCLONE_LOG_LEVEL = os.environ.get("RCLONE_LOG_LEVEL", "INFO")
 RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT = os.environ.get("RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT", "1")
 MODAL_MAX_UPLOADS_PER_REMOTE = int(os.environ.get("MODAL_MAX_UPLOADS_PER_REMOTE", "0"))
+MODAL_CACHE_COMMIT_EVERY = max(1, int(os.environ.get("MODAL_CACHE_COMMIT_EVERY", "25")))
 MODAL_DISCOVER_THREADS = int(os.environ.get("MODAL_DISCOVER_THREADS", "16"))
 MODAL_DISCOVER_SHARD_DEPTH = int(os.environ.get("MODAL_DISCOVER_SHARD_DEPTH", "1"))
 MODAL_MOUNTED_FIND_THREADS = int(os.environ.get("MODAL_MOUNTED_FIND_THREADS", "16"))
@@ -1602,7 +1603,7 @@ def write_indexes(
                     file_count += 1
                     byte_count += int(record["size"])
 
-    subprocess.run(["zstd", "-T0", "-3", "-f", str(files_index_jsonl), "-o", str(files_index_zst)], check=True)
+    subprocess.run(["zstd", "-q", "-T0", "-3", "-f", str(files_index_jsonl), "-o", str(files_index_zst)], check=True)
     files_index_jsonl.unlink()
     strategy = package_strategy(byte_count, max_package_bytes, warn_package_bytes)
 
@@ -1795,7 +1796,7 @@ def upload_archive_stream(unit_abs: Path, remote: str, archive_dest: str, compre
     command = (
         "set -o pipefail; "
         f"tar -C {parent} -cf - {name} "
-        f"| zstd -T0 -{level} "
+        f"| zstd -q -T0 -{level} "
         f"| rclone --config {config} rcat {target} "
         f"{rclone_flags}"
     )
@@ -1812,7 +1813,7 @@ def create_archive_staged(unit_abs: Path, archive_path: Path, compression_level:
     command = (
         "set -o pipefail; "
         f"tar -C {parent} -cf - {name} "
-        f"| zstd -T0 -{level} -o {out}"
+        f"| zstd -q -T0 -{level} -o {out}"
     )
     run_checked(command)
 
@@ -2229,6 +2230,7 @@ def prepare_archives_worker(
     prepared = 0
     skipped = 0
     failed = 0
+    uncommitted = 0
     max_bytes = parse_bytes(max_package_bytes)
     warn_bytes = parse_bytes(warn_package_bytes)
 
@@ -2280,6 +2282,10 @@ def prepare_archives_worker(
                         shutil.copy2(unit_abs, archive_path)
                         manifest_path.write_text(json.dumps(result | {"status": "prepared"}, indent=2, sort_keys=True) + "\n")
                         prepared += 1
+                        uncommitted += 1
+                        if uncommitted >= MODAL_CACHE_COMMIT_EVERY:
+                            cache_volume.commit()
+                            uncommitted = 0
                         result["status"] = "prepared"
                     status_handle.write(json.dumps(result | {"finished_at_unix": int(time.time())}, sort_keys=True) + "\n")
                     status_handle.flush()
@@ -2324,7 +2330,10 @@ def prepare_archives_worker(
                             manifest_path.write_text(json.dumps(result | {"status": "prepared"}, indent=2, sort_keys=True) + "\n")
                             prepared += 1
                             result["status"] = "prepared"
-                            cache_volume.commit()
+                            uncommitted += 1
+                            if uncommitted >= MODAL_CACHE_COMMIT_EVERY:
+                                cache_volume.commit()
+                                uncommitted = 0
             except Exception as exc:  # noqa: BLE001 - keep per-package resume data.
                 result["status"] = "failed"
                 result["error"] = repr(exc)
@@ -2348,6 +2357,7 @@ def prepare_archives_worker(
         "skipped": skipped,
         "failed": failed,
         "dry_run": dry_run,
+        "cache_commit_every": MODAL_CACHE_COMMIT_EVERY,
         "status_path": str(status_path),
     }
 

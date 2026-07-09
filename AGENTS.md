@@ -821,6 +821,8 @@ MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
 
 Spool paths mirror final Drive destination paths under `/cache/archive-spool/<spool-name>/...`. The cache volume must be large enough for the prepared compressed archives. For tens of TiB, start with small `--limit` values and inspect `/state/runs/prepare-worker-...` before scaling.
 
+`MODAL_CACHE_COMMIT_EVERY` controls cache Volume commit frequency during archive preparation. Use a larger value for faster bulk spool creation and a smaller value when interruption/retry granularity matters more than throughput.
+
 Clean an existing shared-drive destination prefix only when the human has explicitly approved destructive cleanup:
 
 ```bash
@@ -836,6 +838,7 @@ Drain prepared archives to Drive only after explicit operator GO:
 ```bash
 RCLONE_TPSLIMIT=1 \
 MODAL_MAX_CONTAINERS=10 \
+MODAL_CACHE_COMMIT_EVERY=25 \
 MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
   scripts/run_modal_volume_adapter.sh upload-prepared \
   --plan-path plans/source-units.jsonl \
