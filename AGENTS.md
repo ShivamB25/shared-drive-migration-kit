@@ -280,6 +280,37 @@ Create the group manually in Google Workspace, for example:
 migration-uploaders@example.com
 ```
 
+## CLI Google Group Creation Workflow
+
+If the active `gcloud` user can create Cloud Identity groups, the Google Group can be created automatically:
+
+```bash
+scripts/create_google_group.sh
+APPLY=1 scripts/create_google_group.sh
+```
+
+The script uses:
+
+```bash
+gcloud identity groups create "$GROUP_EMAIL" \
+  --organization="$GROUP_ORGANIZATION" \
+  --display-name="$GROUP_DISPLAY_NAME" \
+  --description="$GROUP_DESCRIPTION" \
+  --group-type="$GROUP_TYPE" \
+  --with-initial-owner="$WITH_INITIAL_OWNER"
+```
+
+Defaults:
+
+- `GROUP_ORGANIZATION` is derived from the domain part of `GROUP_EMAIL`.
+- `GROUP_TYPE` defaults to `discussion`.
+- `WITH_INITIAL_OWNER` defaults to `with-initial-owner`.
+- Existing groups are described and treated as already complete.
+
+Use `GROUP_CUSTOMER` instead of `GROUP_ORGANIZATION` if a customer ID is preferred.
+
+Manual creation is still a valid fallback when Workspace policy or permissions block CLI creation.
+
 Then generate member artifacts:
 
 ```bash

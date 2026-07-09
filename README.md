@@ -256,6 +256,22 @@ Set it in `.env`:
 GROUP_EMAIL="migration-uploaders@example.com"
 ```
 
+If your active gcloud user can create Cloud Identity groups, create it with CLI:
+
+```bash
+scripts/create_google_group.sh
+APPLY=1 scripts/create_google_group.sh
+```
+
+By default, the script derives the organization domain from `GROUP_EMAIL`. You can override the domain or use a customer ID:
+
+```bash
+GROUP_ORGANIZATION="example.com" APPLY=1 scripts/create_google_group.sh
+GROUP_CUSTOMER="C012abcde" APPLY=1 scripts/create_google_group.sh
+```
+
+Manual group creation is still fine when Workspace policy or permissions block CLI creation.
+
 Generate group-member artifacts:
 
 ```bash
@@ -470,6 +486,9 @@ scripts/bootstrap_gcp_service_accounts.sh
 
 scripts/generate_workspace_group_artifacts.py
   Produces batch files and CSV/JSONL group-member artifacts.
+
+scripts/create_google_group.sh
+  Optionally creates GROUP_EMAIL through gcloud identity groups.
 
 scripts/add_service_accounts_to_group.sh
   Adds service-account emails to GROUP_EMAIL through gcloud identity groups.
