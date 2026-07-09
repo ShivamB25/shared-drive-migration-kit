@@ -57,6 +57,8 @@ The following has been confirmed in a private Google Workspace. Do not commit re
 - the Google Group can be granted shared-drive access from CLI with the Drive API
 - rclone can authenticate to the shared drive using a service-account key and `team_drive`
 
+Note: `gcloud` has Cloud Identity group commands, but no first-class Google Drive shared-drive command group. Shared-drive creation and permission grants should be automated with the Drive API using `gcloud auth print-access-token`.
+
 Public example values:
 
 ```text
@@ -197,6 +199,7 @@ RAND="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 5)"
 GOOGLE_CLOUD_PROJECT="sdmig-${DOMAIN_SLUG}-${RAND}"
 GROUP_EMAIL="drive-migration-uploaders@${WORKSPACE_DOMAIN}"
 GROUP_DISPLAY_NAME="Drive Migration Uploaders"
+SHARED_DRIVE_NAME="Shared Drive Migration Target"
 SA_PREFIX="drive-migrate"
 RCLONE_REMOTE_PREFIX="gdrive-sa"
 ```
@@ -205,12 +208,14 @@ Naming rationale:
 
 - `sdmig-...` is short and leaves room for a random suffix under the 30-character project ID limit.
 - `drive-migration-uploaders@...` is explicit and reusable for the service-account group.
+- `Shared Drive Migration Target` should be renamed by the operator or source adapter to match the dataset/project.
 - `drive-migrate-001` etc. are short enough for service-account IDs.
 - `gdrive-sa001:` etc. are compact rclone remote names.
 
 Agent behavior:
 
 - Ask the human for `SHARED_DRIVE_ID` if it is not already present.
+- If the human wants a new shared drive and the account has permission, run `scripts/create_shared_drive.py` with `WRITE_ENV=1`.
 - Ask the human for `SOURCE_PATH` or run the relevant source adapter that creates it.
 - Prefer an unbilled dedicated project.
 - Do not link billing unless the human explicitly approves it.
@@ -231,6 +236,7 @@ updates = {
     "SA_PREFIX": "drive-migrate",
     "SA_COUNT": "100",
     "SHARED_DRIVE_ID": "0Axxxxxxxxxxxxxxxx",
+    "SHARED_DRIVE_NAME": "Shared Drive Migration Target",
     "GROUP_EMAIL": "drive-migration-uploaders@example.com",
     "GROUP_DISPLAY_NAME": "Drive Migration Uploaders",
     "SOURCE_PATH": "/path/to/source-export",
@@ -476,7 +482,21 @@ Manual path:
 3. Add `GROUP_EMAIL`.
 4. Use Content manager access for normal migration writes.
 
-CLI path, if the active `gcloud` user can manage the shared drive:
+Create/find shared drive from CLI, if the active `gcloud` user can create shared drives:
+
+```bash
+scripts/create_shared_drive.py
+APPLY=1 WRITE_ENV=1 scripts/create_shared_drive.py
+```
+
+The script:
+
+- uses `gcloud auth print-access-token`
+- searches for an existing shared drive with `SHARED_DRIVE_NAME`
+- creates one with Drive API `drives.create` if no match exists
+- writes `SHARED_DRIVE_ID` and `SHARED_DRIVE_NAME` to `.env` when `WRITE_ENV=1`
+
+CLI permission grant, if the active `gcloud` user can manage the shared drive:
 
 ```bash
 scripts/grant_shared_drive_access.py

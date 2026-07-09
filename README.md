@@ -94,6 +94,8 @@ If the operator can manage Google Group memberships, this repo can add all servi
 
 If the operator can manage the shared drive, this repo can grant the group shared-drive access with CLI.
 
+Google Cloud CLI does not expose a first-class `gcloud drive shared-drives ...` command group. Shared-drive automation in this repo uses the active gcloud OAuth token with the Google Drive API. From the operator's point of view it is still CLI-driven.
+
 ## Google Limits That Matter
 
 Current important shared-drive limits:
@@ -134,7 +136,7 @@ gcloud billing accounts list
 
 After that, a coding agent can infer most safe defaults from the active account and organization list. The only values it normally still needs from the human are:
 
-- the destination `SHARED_DRIVE_ID`
+- the destination `SHARED_DRIVE_ID`, or approval to create a new shared drive
 - the source adapter path, `SOURCE_PATH`
 - whether billing may be linked if organization policy blocks unbilled API enablement
 
@@ -162,6 +164,7 @@ RAND="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 5)"
 GOOGLE_CLOUD_PROJECT="sdmig-${DOMAIN_SLUG}-${RAND}"
 GROUP_EMAIL="drive-migration-uploaders@${WORKSPACE_DOMAIN}"
 GROUP_DISPLAY_NAME="Drive Migration Uploaders"
+SHARED_DRIVE_NAME="Shared Drive Migration Target"
 SA_PREFIX="drive-migrate"
 RCLONE_REMOTE_PREFIX="gdrive-sa"
 ```
@@ -170,6 +173,7 @@ Why these names:
 
 - `sdmig-...` keeps the project ID short enough for Google Cloud's 30-character project ID limit.
 - `drive-migration-uploaders@...` describes the group purpose and is reusable for one shared-drive migration target.
+- `Shared Drive Migration Target` is explicit enough for a new destination shared drive; teams should rename it to match their project or dataset.
 - `drive-migrate-001` through `drive-migrate-100` stay under the service-account ID length limit.
 - `gdrive-sa001:` through `gdrive-sa100:` are short rclone remote names.
 
@@ -186,6 +190,7 @@ updates = {
     "SA_PREFIX": "drive-migrate",
     "SA_COUNT": "100",
     "SHARED_DRIVE_ID": "0Axxxxxxxxxxxxxxxx",
+    "SHARED_DRIVE_NAME": "Shared Drive Migration Target",
     "GROUP_EMAIL": "drive-migration-uploaders@example.com",
     "GROUP_DISPLAY_NAME": "Drive Migration Uploaders",
     "SOURCE_PATH": "/path/to/source-export",
@@ -413,7 +418,18 @@ Manual fallback:
 
 ### 8. Add Group To Shared Drive
 
-Preferred CLI path, if your active gcloud user can manage the shared drive:
+If you already have a shared drive, set `SHARED_DRIVE_ID` in `.env`.
+
+If your active gcloud user can create shared drives, create or find one from CLI:
+
+```bash
+scripts/create_shared_drive.py
+APPLY=1 WRITE_ENV=1 scripts/create_shared_drive.py
+```
+
+This writes the created/found ID back to `.env`.
+
+Then grant the group access. Preferred CLI path, if your active gcloud user can manage the shared drive:
 
 ```bash
 scripts/grant_shared_drive_access.py
@@ -582,6 +598,9 @@ scripts/create_google_group.sh
 scripts/add_service_accounts_to_group.sh
   Adds service-account emails to GROUP_EMAIL through gcloud identity groups.
 
+scripts/create_shared_drive.py
+  Optionally creates or finds SHARED_DRIVE_NAME through the Drive API using gcloud auth.
+
 scripts/grant_shared_drive_access.py
   Grants GROUP_EMAIL access to SHARED_DRIVE_ID with Drive API permissions.create.
 
@@ -704,3 +723,7 @@ Check:
 ### `rclone lsf` succeeds with no output
 
 That can mean the shared drive root is empty. Success exit code is what matters.
+
+### Shared drive creation fails
+
+The active Google account may not be allowed to create shared drives, or the Workspace admin may have disabled shared-drive creation. Create the shared drive manually, set `SHARED_DRIVE_ID` in `.env`, and continue from the group grant step.
