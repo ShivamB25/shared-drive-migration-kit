@@ -1,6 +1,46 @@
-/.env
-/secrets/
-/generated/
-/logs/
+# Local environment and operator state.
+.env
+.env.*
+!.env.example
+
+# Credentials and secrets. Service-account JSON files are private keys.
+secrets/
+credentials/
+accounts/
+*.key
+*.pem
+*.p12
+*service-account*.json
+*service_account*.json
+token.pickle
+
+# Generated migration artifacts may contain account emails, local paths, and
+# rclone configs pointing at credential files.
+generated/
+logs/
+*.log
+rclone.conf
+*.rclone.conf
+*.manifest.csv
+
+# Python/runtime artifacts.
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# OS/editor noise.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files.
+tmp/
+temp/
+*.tmp
