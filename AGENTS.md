@@ -2,7 +2,7 @@
 
 This file is the operator runbook for turning a Google Workspace shared drive into a migration target using many Google Cloud service accounts and rclone.
 
-The intended workflow is repeatable for a new person, new Google Workspace organization, or new shared drive. It is deliberately shared-drive-only on the target side, with source adapters feeding local paths into rclone.
+The intended workflow is repeatable for a new person, new Google Workspace organization, or new shared drive. It is deliberately shared-drive-only on the target side, with source adapters producing migration plans and feeding rclone-compatible uploads.
 
 ## Scope
 
@@ -15,7 +15,7 @@ This project handles:
 - generating rclone remotes for a Google shared drive
 - validating service-account access to the shared drive
 - running guarded rclone copy jobs
-- documenting source-adapter handoff through `SOURCE_PATH`
+- documenting source-adapter handoff through plans, packages, or `SOURCE_PATH`
 
 This project does not require:
 
@@ -39,11 +39,43 @@ This avoids adding 100 service accounts directly to the shared drive and keeps f
 
 Source model:
 
-1. A source adapter prepares a local export, mount, or staging directory.
-2. The operator sets `SOURCE_PATH` to that local path.
-3. The shared-drive target scripts upload from `SOURCE_PATH` with rclone.
+1. A source adapter discovers source units and produces a plan.
+2. The adapter either exposes raw files or packages each unit.
+3. The shared-drive target scripts upload with rclone remotes that point at `SHARED_DRIVE_ID`.
 
 Modal volumes are one possible source adapter. The Google shared-drive target setup should remain independent from Modal-specific assumptions.
+
+## Source Adapter Questions
+
+Before writing or running an adapter, ask the operator how the source should be migrated:
+
+- Which adapter is this run using: `local-path`, `modal-volume`, or something else?
+- What source root/prefix is in scope?
+- What is one migration unit: a file, top-level folder, fixed-depth folder, or manifest row?
+- Should upload preserve raw files, or package each unit?
+- If packaging, which format: `tar.zst`, `zip`, `tar`, or another format?
+- Should each package have a small package index and a compressed file index next to it?
+- Where should packages land inside the shared drive?
+- What source-side concurrency limit should be respected?
+- How many Google Drive remotes/service accounts should each worker rotate through?
+- Should the first execution be dry-run, synthetic smoke, one-worker, limited real run, or full run?
+
+For sources with millions of files, prefer package-per-unit output plus `<unit>.package.index.json` and `<unit>.files.index.jsonl.zst`; raw file upload can hit shared-drive item limits even when storage capacity is not the issue.
+
+## Operating Style
+
+Trust the human operator on source semantics: source layout, package boundaries, account limits they know from their provider, and what should land in the shared drive. Verify platform behavior before relying on it: Modal API metadata shape, Drive/rclone behavior, mounted paths, auth state, and cleanup scope.
+
+Default escalation path:
+
+1. Ask the adapter-shape questions above.
+2. Use existing CLI auth when it works; do not ask for pasted tokens.
+3. Discover with API metadata where available.
+4. Smoke upload synthetic data.
+5. Launch one worker with `--dry-run --limit 1`.
+6. Launch one worker with `--no-dry-run --limit 1`.
+7. Verify with rclone listing.
+8. Only then widen concurrency.
 
 ## Confirmed Working Path
 
@@ -56,6 +88,9 @@ The following has been confirmed in a private Google Workspace. Do not commit re
 - service-account emails can be added directly to a Google Group with `gcloud identity groups memberships add`
 - the Google Group can be granted shared-drive access from CLI with the Drive API
 - rclone can authenticate to the shared drive using a service-account key and `team_drive`
+- Modal Volume planning can use the local authenticated Modal SDK/CLI profile without pasted tokens
+- Modal recursive Volume metadata listing returns direct file sizes, but directories report `0 B`
+- a Modal staged upload can package one source unit as `tar.zst`, upload package indexes, and verify through rclone
 
 Note: `gcloud` has Cloud Identity group commands, but no first-class Google Drive shared-drive command group. Shared-drive creation and permission grants should be automated with the Drive API using `gcloud auth print-access-token`.
 
@@ -640,6 +675,113 @@ Outputs:
 - `generated/upload_commands.sh`
 
 The generated commands default to `--dry-run`. Review them before removing `--dry-run`.
+
+## Rclone Large Archive Defaults
+
+Use these defaults for Google shared-drive uploads when the source adapter produces large `tar.zst` package files. References: [rclone Google Drive docs](https://rclone.org/drive/) and [rclone install docs](https://rclone.org/install/).
+
+```bash
+RCLONE_DRIVE_CHUNK_SIZE="512M"
+RCLONE_TRANSFERS="1"
+RCLONE_CHECKERS="4"
+RCLONE_TPSLIMIT="5"
+RCLONE_TPSLIMIT_BURST="0"
+RCLONE_RETRIES="3"
+RCLONE_LOW_LEVEL_RETRIES="20"
+RCLONE_RETRIES_SLEEP="30s"
+RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT="1"
+```
+
+Operator notes:
+
+- rclone's Google Drive docs define `--drive-chunk-size` as the upload chunk size and warn that bigger chunks use more memory per transfer.
+- `512M` is the starting value for package uploads. `1G` can be tested later only if worker memory and retry behavior are acceptable.
+- Keep `RCLONE_TRANSFERS=1` for Modal package workers. Concurrency should come from separate workers/service accounts, not multiple huge uploads inside one container.
+- `RCLONE_TPSLIMIT=5` with burst `0` is intentionally conservative. Lower it if Google returns rate-limit errors.
+- Keep `RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT=1`; a worker should stop when Drive reports the daily upload limit.
+- Prefer direct rclone operations (`copy`, `copyto`, `rcat`) over rclone mount for migration uploads.
+- The Modal image should install rclone from the official rclone installer, not the Debian package, because distro packages can be old.
+
+## Modal Volume Adapter
+
+Use the Modal adapter only when the source data is already in a Modal Volume or can be read efficiently from one. Keep the target side generic: the adapter emits packages and uses the generated shared-drive rclone remotes.
+
+Default Modal adapter behavior:
+
+- mount source volume read-only at `/src`
+- mount private rclone/key bundle at `/creds`
+- mount writable cache Volume v2 at `/cache`
+- write run plans and status to a separate Modal state volume
+- package units as `tar.zst`
+- upload archives with `rclone rcat` in stream mode or `rclone copyto` in staged mode
+- upload `<unit>.package.index.json` next to each archive
+- upload `<unit>.files.index.jsonl.zst` next to each archive
+- default to `10` Modal workers and `10` rclone remotes per worker
+
+Do not rely on `modal volume ls --json` for recursive directory sizes. It reports direct file sizes but directories as `0 B`. Normal adapter discovery uses `Volume.listdir(..., recursive=True)` through the authenticated Modal SDK and sums file-entry sizes from metadata. Real upload workers still recalculate package indexes and must skip units above `--max-package-bytes` instead of producing an archive that can exceed the Drive daily upload ceiling.
+
+Prepare Modal credentials:
+
+```bash
+scripts/generate_modal_rclone_bundle.py
+scripts/upload_modal_rclone_bundle.sh
+```
+
+Discover a limited plan:
+
+```bash
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh discover \
+  --source-prefix aa \
+  --unit-depth 1 \
+  --dest-prefix source-volume-name \
+  --plan-path plans/source-aa-smoke.jsonl \
+  --limit 3
+```
+
+Normal `discover` uses the local authenticated Modal SDK/CLI profile and `Volume.listdir(..., recursive=True)` metadata. Do not ask the human to paste Modal tokens if `modal volume list` already works. Direct file entries include byte sizes; directory entries report `0 B`, so aggregate unit size must be calculated by summing recursive file entries. Use `discover-mounted` only as a fallback comparison path.
+
+Launch only worker 0 from the 10-worker plan:
+
+```bash
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh upload \
+  --plan-path plans/source-aa-smoke.jsonl \
+  --worker-count 10 \
+  --worker-index 0 \
+  --remote-group-size 10 \
+  --upload-mode staged \
+  --max-package-bytes 700GiB \
+  --warn-package-bytes 650GiB \
+  --dry-run \
+  --limit 1
+```
+
+Launch one real worker only after the dry-run output is reviewed:
+
+```bash
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh upload \
+  --plan-path plans/source-aa-smoke.jsonl \
+  --worker-count 10 \
+  --worker-index 0 \
+  --remote-group-size 10 \
+  --upload-mode staged \
+  --max-package-bytes 700GiB \
+  --warn-package-bytes 650GiB \
+  --no-dry-run \
+  --limit 1
+```
+
+Verify the package folder with rclone before increasing workers:
+
+```bash
+rclone --config generated/rclone.conf lsf \
+  "gdrive-sa001:source-volume-name/aa/example-package-folder" \
+  --max-depth 1
+```
+
+Use `--no-dry-run` only after confirming the package unit, destination prefix, and cleanup plan. For real source uploads, avoid broad cleanup commands; cleanup automation is intentionally restricted to `_sdmig_smoke/...` unless an unsafe-delete override is explicitly passed.
 
 ## Safety Rules
 

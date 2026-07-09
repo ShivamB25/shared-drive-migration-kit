@@ -93,18 +93,48 @@ def main() -> int:
                 row["destination"],
                 "--dry-run",
                 "--transfers",
-                "${TRANSFERS:-4}",
+                "${RCLONE_TRANSFERS:-1}",
                 "--checkers",
-                "${CHECKERS:-8}",
+                "${RCLONE_CHECKERS:-4}",
                 "--drive-chunk-size",
-                "256M",
+                "${RCLONE_DRIVE_CHUNK_SIZE:-512M}",
+                "--retries",
+                "${RCLONE_RETRIES:-3}",
+                "--low-level-retries",
+                "${RCLONE_LOW_LEVEL_RETRIES:-20}",
+                "--retries-sleep",
+                "${RCLONE_RETRIES_SLEEP:-30s}",
+                "--contimeout",
+                "${RCLONE_CONTIMEOUT:-60s}",
+                "--timeout",
+                "${RCLONE_TIMEOUT:-5m}",
+                "--tpslimit",
+                "${RCLONE_TPSLIMIT:-5}",
+                "--tpslimit-burst",
+                "${RCLONE_TPSLIMIT_BURST:-0}",
+                "--drive-stop-on-upload-limit",
                 "--progress",
                 "--stats",
-                "30s",
+                "${RCLONE_STATS:-30s}",
+                "--stats-file-name-length",
+                "${RCLONE_STATS_FILE_NAME_LENGTH:-0}",
             ]
             rendered = " ".join(shlex.quote(part) for part in command)
-            rendered = rendered.replace("'${TRANSFERS:-4}'", "${TRANSFERS:-4}")
-            rendered = rendered.replace("'${CHECKERS:-8}'", "${CHECKERS:-8}")
+            for var in [
+                "RCLONE_TRANSFERS:-1",
+                "RCLONE_CHECKERS:-4",
+                "RCLONE_DRIVE_CHUNK_SIZE:-512M",
+                "RCLONE_RETRIES:-3",
+                "RCLONE_LOW_LEVEL_RETRIES:-20",
+                "RCLONE_RETRIES_SLEEP:-30s",
+                "RCLONE_CONTIMEOUT:-60s",
+                "RCLONE_TIMEOUT:-5m",
+                "RCLONE_TPSLIMIT:-5",
+                "RCLONE_TPSLIMIT_BURST:-0",
+                "RCLONE_STATS:-30s",
+                "RCLONE_STATS_FILE_NAME_LENGTH:-0",
+            ]:
+                rendered = rendered.replace(f"'${{{var}}}'", f"${{{var}}}")
             handle.write(rendered)
             handle.write("\n")
     commands_out.chmod(0o755)
@@ -118,4 +148,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
