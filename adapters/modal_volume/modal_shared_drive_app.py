@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import os
+import shutil
 import shlex
 import subprocess
 import tempfile
@@ -1490,7 +1491,7 @@ def load_remotes(worker_index: int, remote_group_size: int) -> list[str]:
         rows = [row for row in csv.DictReader(handle) if row.get("remote")]
 
     assigned = [row["remote"] for row in rows if row.get("worker_index") == str(worker_index)]
-    if assigned:
+    if len(assigned) >= remote_group_size:
         return assigned
 
     start = worker_index * remote_group_size
@@ -1502,6 +1503,31 @@ def load_remotes(worker_index: int, remote_group_size: int) -> list[str]:
     if not all_remotes:
         raise RuntimeError("no remotes in rclone manifest")
     return [all_remotes[worker_index % len(all_remotes)]]
+
+
+def row_belongs_to_worker(row_index: int, total_rows: int, worker_index: int, worker_count: int, assignment_mode: str) -> bool:
+    if worker_count <= 1:
+        return worker_index == 0
+    if assignment_mode == "modulo":
+        return row_index % worker_count == worker_index
+    if assignment_mode == "contiguous":
+        start = (total_rows * worker_index) // worker_count
+        end = (total_rows * (worker_index + 1)) // worker_count
+        return start <= row_index < end
+    raise ValueError("assignment_mode must be 'modulo' or 'contiguous'")
+
+
+def default_spool_name(plan_path: str) -> str:
+    return Path(clean_relative_path(plan_path)).stem
+
+
+def spool_base(spool_name: str, plan_path: str) -> Path:
+    name = clean_relative_path(spool_name or default_spool_name(plan_path)).as_posix()
+    return CACHE_MOUNT / "archive-spool" / name
+
+
+def spool_file_path(spool_root: Path, dest_path: str) -> Path:
+    return spool_root / clean_relative_path(dest_path)
 
 
 def file_record(path: Path, base: Path) -> dict[str, Any]:
@@ -1729,6 +1755,20 @@ def rclone_copyto(remote: str, dest_path: str, local_path: Path) -> None:
     command.extend(rclone_common_args())
     result = subprocess.run(command, text=True, capture_output=True)
     raise_for_rclone_failure(result, f"rclone copyto {remote}:{dest_path}")
+
+
+def rclone_moveto(remote: str, dest_path: str, local_path: Path) -> None:
+    command = [
+        "rclone",
+        "--config",
+        str(RCLONE_CONFIG),
+        "moveto",
+        str(local_path),
+        f"{remote}:{dest_path}",
+    ]
+    command.extend(rclone_common_args())
+    result = subprocess.run(command, text=True, capture_output=True)
+    raise_for_rclone_failure(result, f"rclone moveto {remote}:{dest_path}")
 
 
 def rclone_purge(remote: str, dest_prefix: str, dry_run: bool) -> None:
@@ -1988,6 +2028,7 @@ def upload_worker(
     worker_count: int = 10,
     plan_path: str = "plans/modal-volume-units.jsonl",
     remote_group_size: int = 10,
+    assignment_mode: str = "modulo",
     dry_run: bool = True,
     limit: int = 0,
     compression_level: int = 3,
@@ -2017,7 +2058,7 @@ def upload_worker(
     with status_path.open("w") as status_handle:
         for row in rows:
             row_index = int(row["index"])
-            if row_index % worker_count != worker_index:
+            if not row_belongs_to_worker(row_index, len(rows), worker_index, worker_count, assignment_mode):
                 continue
             if not active_remotes:
                 break
@@ -2030,6 +2071,7 @@ def upload_worker(
             files_index_dest = row.get("files_index_dest") or f"{archive_dest}.files.index.jsonl.zst"
             result: dict[str, Any] = {
                 "worker_index": worker_index,
+                "assignment_mode": assignment_mode,
                 "row_index": row_index,
                 "remote": remote,
                 "source_path": unit_rel,
@@ -2136,6 +2178,296 @@ def upload_worker(
     return {
         "worker_index": worker_index,
         "worker_count": worker_count,
+        "assignment_mode": assignment_mode,
+        "remotes": remotes,
+        "active_remotes": active_remotes,
+        "retired_remotes": retired_remotes,
+        "remote_upload_counts": remote_upload_counts,
+        "max_uploads_per_remote": max_uploads_per_remote,
+        "processed": processed,
+        "uploaded": uploaded,
+        "skipped": skipped,
+        "failed": failed,
+        "dry_run": dry_run,
+        "status_path": str(status_path),
+    }
+
+
+@app.function(
+    image=image,
+    volumes={
+        str(SOURCE_MOUNT): source_volume,
+        str(STATE_MOUNT): state_volume,
+        str(CACHE_MOUNT): cache_volume,
+    },
+    timeout=env_int("MODAL_TIMEOUT", 43200),
+    cpu=float(os.environ.get("MODAL_CPU", "2")),
+    memory=env_int("MODAL_MEMORY", 4096),
+    ephemeral_disk=env_int("MODAL_EPHEMERAL_DISK", 524288),
+    max_containers=env_int("MODAL_MAX_CONTAINERS", 10),
+    retries=1,
+)
+def prepare_archives_worker(
+    worker_index: int,
+    worker_count: int = 10,
+    plan_path: str = "plans/modal-volume-units.jsonl",
+    assignment_mode: str = "contiguous",
+    spool_name: str = "",
+    dry_run: bool = True,
+    limit: int = 0,
+    compression_level: int = 3,
+    max_package_bytes: str = "700GiB",
+    warn_package_bytes: str = "650GiB",
+) -> dict[str, Any]:
+    rows = load_plan(plan_path)
+    spool_root = spool_base(spool_name, plan_path)
+    status_dir = STATE_MOUNT / "runs" / f"prepare-worker-{worker_index:03d}"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    status_path = status_dir / f"{int(time.time())}.jsonl"
+
+    processed = 0
+    prepared = 0
+    skipped = 0
+    failed = 0
+    max_bytes = parse_bytes(max_package_bytes)
+    warn_bytes = parse_bytes(warn_package_bytes)
+
+    with status_path.open("w") as status_handle:
+        for row in rows:
+            row_index = int(row["index"])
+            if not row_belongs_to_worker(row_index, len(rows), worker_index, worker_count, assignment_mode):
+                continue
+            row_kind = row.get("kind", "package")
+            unit_rel = row["source_path"]
+            unit_abs = SOURCE_MOUNT / clean_relative_path(unit_rel)
+            archive_dest = row["archive_dest"]
+            package_index_dest = row.get("package_index_dest") or row.get("index_dest") or f"{archive_dest}.package.index.json"
+            files_index_dest = row.get("files_index_dest") or f"{archive_dest}.files.index.jsonl.zst"
+            archive_path = spool_file_path(spool_root, archive_dest)
+            package_index_path = spool_file_path(spool_root, package_index_dest)
+            files_index_path = spool_file_path(spool_root, files_index_dest)
+            manifest_path = archive_path.with_suffix(archive_path.suffix + ".spool.json")
+            result: dict[str, Any] = {
+                "worker_index": worker_index,
+                "worker_count": worker_count,
+                "assignment_mode": assignment_mode,
+                "row_index": row_index,
+                "source_path": unit_rel,
+                "archive_dest": archive_dest,
+                "package_index_dest": package_index_dest,
+                "files_index_dest": files_index_dest,
+                "spool_archive_path": str(archive_path),
+                "spool_package_index_path": str(package_index_path),
+                "spool_files_index_path": str(files_index_path),
+                "spool_manifest_path": str(manifest_path),
+                "kind": row_kind,
+                "dry_run": dry_run,
+                "started_at_unix": int(time.time()),
+            }
+            try:
+                ensure_inside(unit_abs, SOURCE_MOUNT)
+                if row_kind == "raw_file":
+                    if not unit_abs.exists() or not unit_abs.is_file():
+                        raise FileNotFoundError(f"missing raw source file: {unit_abs}")
+                    result["bytes"] = unit_abs.stat().st_size
+                    if archive_path.exists():
+                        result["status"] = "already_prepared"
+                        skipped += 1
+                    elif dry_run:
+                        result["status"] = "planned"
+                    else:
+                        archive_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(unit_abs, archive_path)
+                        manifest_path.write_text(json.dumps(result | {"status": "prepared"}, indent=2, sort_keys=True) + "\n")
+                        prepared += 1
+                        result["status"] = "prepared"
+                    status_handle.write(json.dumps(result | {"finished_at_unix": int(time.time())}, sort_keys=True) + "\n")
+                    status_handle.flush()
+                    processed += 1
+                    if limit > 0 and processed >= limit:
+                        break
+                    continue
+
+                if not unit_abs.exists() or not unit_abs.is_dir():
+                    raise FileNotFoundError(f"missing source package directory: {unit_abs}")
+                if archive_path.exists() and package_index_path.exists() and files_index_path.exists():
+                    result["status"] = "already_prepared"
+                    skipped += 1
+                elif dry_run:
+                    result["status"] = "planned"
+                else:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        tmp_path = Path(tmp)
+                        index_info = write_indexes(
+                            unit_abs,
+                            row.get("source_volume", SOURCE_VOLUME_NAME),
+                            unit_rel,
+                            archive_dest,
+                            package_index_dest,
+                            files_index_dest,
+                            tmp_path,
+                            max_bytes,
+                            warn_bytes,
+                        )
+                        result.update(index_info)
+                        if index_info["package_strategy"] == "split_required":
+                            result["status"] = "skipped_split_required"
+                            skipped += 1
+                        else:
+                            create_archive_staged(unit_abs, archive_path, compression_level)
+                            package_index_path.parent.mkdir(parents=True, exist_ok=True)
+                            files_index_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(index_info["package_index_path"], package_index_path)
+                            shutil.copy2(index_info["files_index_path"], files_index_path)
+                            result["archive_bytes"] = archive_path.stat().st_size
+                            result["archive_sha256"] = sha256_file(archive_path)
+                            manifest_path.write_text(json.dumps(result | {"status": "prepared"}, indent=2, sort_keys=True) + "\n")
+                            prepared += 1
+                            result["status"] = "prepared"
+                            cache_volume.commit()
+            except Exception as exc:  # noqa: BLE001 - keep per-package resume data.
+                result["status"] = "failed"
+                result["error"] = repr(exc)
+                failed += 1
+            result["finished_at_unix"] = int(time.time())
+            status_handle.write(json.dumps(result, sort_keys=True) + "\n")
+            status_handle.flush()
+            processed += 1
+            if limit > 0 and processed >= limit:
+                break
+
+    state_volume.commit()
+    cache_volume.commit()
+    return {
+        "worker_index": worker_index,
+        "worker_count": worker_count,
+        "assignment_mode": assignment_mode,
+        "spool_root": str(spool_root),
+        "processed": processed,
+        "prepared": prepared,
+        "skipped": skipped,
+        "failed": failed,
+        "dry_run": dry_run,
+        "status_path": str(status_path),
+    }
+
+
+@app.function(
+    image=image,
+    volumes={
+        str(CREDS_MOUNT): creds_volume,
+        str(STATE_MOUNT): state_volume,
+        str(CACHE_MOUNT): cache_volume,
+    },
+    timeout=env_int("MODAL_TIMEOUT", 43200),
+    cpu=float(os.environ.get("MODAL_CPU", "2")),
+    memory=env_int("MODAL_MEMORY", 4096),
+    ephemeral_disk=env_int("MODAL_EPHEMERAL_DISK", 524288),
+    max_containers=env_int("MODAL_MAX_CONTAINERS", 10),
+    retries=1,
+)
+def upload_prepared_worker(
+    worker_index: int,
+    worker_count: int = 10,
+    plan_path: str = "plans/modal-volume-units.jsonl",
+    remote_group_size: int = 10,
+    assignment_mode: str = "contiguous",
+    spool_name: str = "",
+    dry_run: bool = True,
+    limit: int = 0,
+    max_uploads_per_remote: int = MODAL_MAX_UPLOADS_PER_REMOTE,
+) -> dict[str, Any]:
+    rows = load_plan(plan_path)
+    remotes = load_remotes(worker_index, remote_group_size)
+    active_remotes = list(remotes)
+    retired_remotes: dict[str, str] = {}
+    remote_upload_counts = {remote: 0 for remote in remotes}
+    spool_root = spool_base(spool_name, plan_path)
+    status_dir = STATE_MOUNT / "runs" / f"upload-prepared-worker-{worker_index:03d}"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    status_path = status_dir / f"{int(time.time())}.jsonl"
+
+    processed = 0
+    uploaded = 0
+    skipped = 0
+    failed = 0
+    with status_path.open("w") as status_handle:
+        for row in rows:
+            row_index = int(row["index"])
+            if not row_belongs_to_worker(row_index, len(rows), worker_index, worker_count, assignment_mode):
+                continue
+            if not active_remotes:
+                break
+            remote = active_remotes[processed % len(active_remotes)]
+            row_kind = row.get("kind", "package")
+            archive_dest = row["archive_dest"]
+            package_index_dest = row.get("package_index_dest") or row.get("index_dest") or f"{archive_dest}.package.index.json"
+            files_index_dest = row.get("files_index_dest") or f"{archive_dest}.files.index.jsonl.zst"
+            archive_path = spool_file_path(spool_root, archive_dest)
+            package_index_path = spool_file_path(spool_root, package_index_dest)
+            files_index_path = spool_file_path(spool_root, files_index_dest)
+            result: dict[str, Any] = {
+                "worker_index": worker_index,
+                "worker_count": worker_count,
+                "assignment_mode": assignment_mode,
+                "row_index": row_index,
+                "remote": remote,
+                "archive_dest": archive_dest,
+                "package_index_dest": package_index_dest,
+                "files_index_dest": files_index_dest,
+                "spool_archive_path": str(archive_path),
+                "spool_package_index_path": str(package_index_path),
+                "spool_files_index_path": str(files_index_path),
+                "kind": row_kind,
+                "dry_run": dry_run,
+                "started_at_unix": int(time.time()),
+            }
+            try:
+                if not archive_path.exists():
+                    result["status"] = "missing_prepared_archive"
+                    skipped += 1
+                elif row_kind != "raw_file" and (not package_index_path.exists() or not files_index_path.exists()):
+                    result["status"] = "missing_prepared_indexes"
+                    skipped += 1
+                elif dry_run:
+                    result["status"] = "planned"
+                else:
+                    rclone_copyto(remote, archive_dest, archive_path)
+                    if row_kind != "raw_file":
+                        rclone_copyto(remote, package_index_dest, package_index_path)
+                        rclone_copyto(remote, files_index_dest, files_index_path)
+                        package_index_path.unlink(missing_ok=True)
+                        files_index_path.unlink(missing_ok=True)
+                    archive_path.unlink(missing_ok=True)
+                    uploaded += 1
+                    remote_upload_counts[remote] += 1
+                    result["status"] = "uploaded_and_removed_from_spool"
+                    if max_uploads_per_remote > 0 and remote_upload_counts[remote] >= max_uploads_per_remote:
+                        retired_remotes[remote] = f"max_uploads_per_remote={max_uploads_per_remote}"
+                        active_remotes = [candidate for candidate in active_remotes if candidate != remote]
+                    cache_volume.commit()
+            except Exception as exc:  # noqa: BLE001 - keep per-package resume data.
+                result["status"] = "failed"
+                result["error"] = repr(exc)
+                failed += 1
+                if is_drive_rate_limit_error(exc):
+                    result["status"] = "remote_rate_limited"
+                    retired_remotes[remote] = "drive_rate_limit"
+                    active_remotes = [candidate for candidate in active_remotes if candidate != remote]
+            result["finished_at_unix"] = int(time.time())
+            status_handle.write(json.dumps(result, sort_keys=True) + "\n")
+            status_handle.flush()
+            processed += 1
+            if limit > 0 and processed >= limit:
+                break
+
+    state_volume.commit()
+    cache_volume.commit()
+    return {
+        "worker_index": worker_index,
+        "worker_count": worker_count,
+        "assignment_mode": assignment_mode,
+        "spool_root": str(spool_root),
         "remotes": remotes,
         "active_remotes": active_remotes,
         "retired_remotes": retired_remotes,
@@ -2159,6 +2491,8 @@ def main(
     plan_path: str = "plans/modal-volume-units.jsonl",
     worker_count: int = 10,
     remote_group_size: int = 10,
+    assignment_mode: str = os.environ.get("MODAL_ASSIGNMENT_MODE", "contiguous"),
+    spool_name: str = os.environ.get("MODAL_SPOOL_NAME", ""),
     dry_run: bool = True,
     limit: int = 0,
     include_stats: bool = False,
@@ -2247,12 +2581,54 @@ def main(
                 worker_count=worker_count,
                 plan_path=plan_path,
                 remote_group_size=remote_group_size,
+                assignment_mode=assignment_mode,
                 dry_run=dry_run,
                 limit=limit,
                 compression_level=compression_level,
                 upload_mode=upload_mode,
                 max_package_bytes=max_package_bytes,
                 warn_package_bytes=warn_package_bytes,
+                max_uploads_per_remote=max_uploads_per_remote,
+            )
+            for index in worker_indexes
+        ]
+        results = [call.get() for call in calls]
+        print(json.dumps(results, indent=2, sort_keys=True))
+        return
+
+    if command == "prepare-archives":
+        worker_indexes = [worker_index] if worker_index >= 0 else list(range(worker_count))
+        calls = [
+            prepare_archives_worker.spawn(
+                worker_index=index,
+                worker_count=worker_count,
+                plan_path=plan_path,
+                assignment_mode=assignment_mode,
+                spool_name=spool_name,
+                dry_run=dry_run,
+                limit=limit,
+                compression_level=compression_level,
+                max_package_bytes=max_package_bytes,
+                warn_package_bytes=warn_package_bytes,
+            )
+            for index in worker_indexes
+        ]
+        results = [call.get() for call in calls]
+        print(json.dumps(results, indent=2, sort_keys=True))
+        return
+
+    if command == "upload-prepared":
+        worker_indexes = [worker_index] if worker_index >= 0 else list(range(worker_count))
+        calls = [
+            upload_prepared_worker.spawn(
+                worker_index=index,
+                worker_count=worker_count,
+                plan_path=plan_path,
+                remote_group_size=remote_group_size,
+                assignment_mode=assignment_mode,
+                spool_name=spool_name,
+                dry_run=dry_run,
+                limit=limit,
                 max_uploads_per_remote=max_uploads_per_remote,
             )
             for index in worker_indexes

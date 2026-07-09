@@ -774,6 +774,68 @@ MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
 
 In this mode, one Modal container processes all plan rows, rotates across up to 100 remotes, and retires a remote when rclone reports a Drive upload/rate-limit error such as `userRateLimitExceeded`. `--limit` caps total package attempts for the run; `--max-uploads-per-remote` caps successful packages per service account. Raise both only after checking the worker status JSONL under `/state/runs/worker-000/...`.
 
+For very large source volumes, prefer a two-phase archive spool when Drive is unstable:
+
+```text
+/src Modal Volume -> tar.zst + indexes in /cache archive spool
+/cache archive spool -> Shared Drive, then remove local spool files after successful upload
+```
+
+The source volume remains read-only. The cache volume must have enough capacity for the prepared archives. For a 72 TiB source, this can require tens of TiB of Modal Volume storage even with zstd compression, so start with small limits and inspect `/state/runs/prepare-worker-...` before scaling.
+
+Prepare archives into the cache volume without touching Drive:
+
+```bash
+MODAL_MAX_CONTAINERS=10 \
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh prepare-archives \
+  --plan-path plans/source-units.jsonl \
+  --worker-count 10 \
+  --assignment-mode contiguous \
+  --spool-name source-units-spool \
+  --max-package-bytes 700GiB \
+  --warn-package-bytes 650GiB \
+  --no-dry-run \
+  --limit 100
+```
+
+Each worker gets a contiguous sorted slice of the plan, which keeps folder ranges together. The prepared spool layout mirrors the final Drive destination:
+
+```text
+/cache/archive-spool/<spool-name>/<unit>/<unit>.tar.zst
+/cache/archive-spool/<spool-name>/<unit>/<unit>.package.index.json
+/cache/archive-spool/<spool-name>/<unit>/<unit>.files.index.jsonl.zst
+```
+
+After the spool is prepared and reviewed, clean only the intended destination prefix if you want a fresh Drive target:
+
+```bash
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh cleanup \
+  --dest-prefix source-volume-name \
+  --allow-unsafe-delete \
+  --no-dry-run
+```
+
+Drain prepared files to Drive only after an explicit operator GO:
+
+```bash
+RCLONE_TPSLIMIT=1 \
+MODAL_MAX_CONTAINERS=10 \
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh upload-prepared \
+  --plan-path plans/source-units.jsonl \
+  --worker-count 10 \
+  --remote-group-size 10 \
+  --assignment-mode contiguous \
+  --spool-name source-units-spool \
+  --max-uploads-per-remote 1 \
+  --no-dry-run \
+  --limit 100
+```
+
+`upload-prepared` copies the archive and index files to Drive, then removes the local spool files only after all files for that package have uploaded successfully. This is safer than per-file `moveto`, which can orphan an archive if an index upload fails.
+
 Modal Volume size note: `modal volume ls --json` exposes direct file sizes, but directories report `0 B`; Modal's dashboard exposes whole-volume size, not recursive package-unit size. The adapter therefore uses the Modal SDK recursive listing API to calculate package-unit size from file metadata. Real uploads also calculate the package index before archiving and skip units larger than `--max-package-bytes`.
 
 Package naming:

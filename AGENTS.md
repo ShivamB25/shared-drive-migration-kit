@@ -794,6 +794,62 @@ MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
 
 In this mode, one worker owns the full plan and rotates across up to 100 service-account remotes. The worker retires a remote from its active rotation when rclone reports a Drive upload/rate-limit response. The returned summary includes `active_remotes`, `retired_remotes`, and `remote_upload_counts`; inspect those before raising `--limit`, `--max-uploads-per-remote`, or worker count.
 
+For very large sources or Drive-sensitive runs, use the archive spool workflow before asking the operator for final upload GO:
+
+```text
+source Modal Volume -> prepared tar.zst/index files in cache Modal Volume
+cache Modal Volume -> Shared Drive drain, then remove local spool files after success
+```
+
+Use contiguous assignment for this workflow. The plan is sorted by source path, so contiguous worker slices preserve folder ranges better than modulo assignment.
+
+Prepare a limited archive spool:
+
+```bash
+MODAL_MAX_CONTAINERS=10 \
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh prepare-archives \
+  --plan-path plans/source-units.jsonl \
+  --worker-count 10 \
+  --assignment-mode contiguous \
+  --spool-name source-units-spool \
+  --max-package-bytes 700GiB \
+  --warn-package-bytes 650GiB \
+  --no-dry-run \
+  --limit 100
+```
+
+Spool paths mirror final Drive destination paths under `/cache/archive-spool/<spool-name>/...`. The cache volume must be large enough for the prepared compressed archives. For tens of TiB, start with small `--limit` values and inspect `/state/runs/prepare-worker-...` before scaling.
+
+Clean an existing shared-drive destination prefix only when the human has explicitly approved destructive cleanup:
+
+```bash
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh cleanup \
+  --dest-prefix source-volume-name \
+  --allow-unsafe-delete \
+  --no-dry-run
+```
+
+Drain prepared archives to Drive only after explicit operator GO:
+
+```bash
+RCLONE_TPSLIMIT=1 \
+MODAL_MAX_CONTAINERS=10 \
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh upload-prepared \
+  --plan-path plans/source-units.jsonl \
+  --worker-count 10 \
+  --remote-group-size 10 \
+  --assignment-mode contiguous \
+  --spool-name source-units-spool \
+  --max-uploads-per-remote 1 \
+  --no-dry-run \
+  --limit 100
+```
+
+`upload-prepared` copies all package files to Drive first and deletes the local spool files after the package upload succeeds. This intentionally avoids per-file move semantics that can leave orphaned packages or missing indexes after a partial failure.
+
 Verify the package folder with rclone before increasing workers:
 
 ```bash
