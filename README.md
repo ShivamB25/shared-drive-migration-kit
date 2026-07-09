@@ -633,6 +633,7 @@ RCLONE_RETRIES="3"
 RCLONE_LOW_LEVEL_RETRIES="20"
 RCLONE_RETRIES_SLEEP="30s"
 RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT="1"
+MODAL_MAX_UPLOADS_PER_REMOTE="0"
 ```
 
 Reasoning:
@@ -642,6 +643,7 @@ Reasoning:
 - `512M` is the default package-upload chunk size. Try `1G` only after confirming container memory and network behavior.
 - `RCLONE_TPSLIMIT=5` and burst `0` reduce API spikes. Lower this to `2` or `3` if Drive returns rate-limit errors.
 - `--drive-stop-on-upload-limit` makes Google's daily upload-limit response fatal instead of repeatedly wasting time on a package that cannot complete that day.
+- `MODAL_MAX_UPLOADS_PER_REMOTE=0` means unlimited successful packages per service-account remote. Set it to a small number when testing Drive behavior.
 - Use direct rclone commands (`copy`, `copyto`, or `rcat`) for migration uploads. Avoid uploading through an rclone mount for this workflow.
 
 The Modal image installs rclone with the official rclone install script because distribution packages can lag the current stable release.
@@ -752,6 +754,25 @@ MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
 ```
 
 The adapter defaults to `MODAL_MAX_CONTAINERS=10`, `MODAL_WORKER_COUNT=10`, and `MODAL_REMOTE_GROUP_SIZE=10`. That means each Modal worker gets a lane of the plan and rotates through 10 rclone remotes/service accounts. Keep `--dry-run` until the plan, destination paths, and package format are confirmed.
+
+For Drive-sensitive runs, prefer fewer upload workers with more service accounts per worker. This keeps package uploads serial or near-serial while still rotating through many service-account remotes:
+
+```bash
+RCLONE_TPSLIMIT=1 \
+MODAL_MAX_CONTAINERS=1 \
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh upload \
+  --plan-path plans/source-units.jsonl \
+  --worker-count 1 \
+  --worker-index 0 \
+  --remote-group-size 100 \
+  --upload-mode stream \
+  --max-uploads-per-remote 1 \
+  --no-dry-run \
+  --limit 100
+```
+
+In this mode, one Modal container processes all plan rows, rotates across up to 100 remotes, and retires a remote when rclone reports a Drive upload/rate-limit error such as `userRateLimitExceeded`. `--limit` caps total package attempts for the run; `--max-uploads-per-remote` caps successful packages per service account. Raise both only after checking the worker status JSONL under `/state/runs/worker-000/...`.
 
 Modal Volume size note: `modal volume ls --json` exposes direct file sizes, but directories report `0 B`; Modal's dashboard exposes whole-volume size, not recursive package-unit size. The adapter therefore uses the Modal SDK recursive listing API to calculate package-unit size from file metadata. Real uploads also calculate the package index before archiving and skip units larger than `--max-package-bytes`.
 

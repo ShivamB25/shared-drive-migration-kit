@@ -44,6 +44,7 @@ RCLONE_STATS = os.environ.get("RCLONE_STATS", "30s")
 RCLONE_STATS_FILE_NAME_LENGTH = os.environ.get("RCLONE_STATS_FILE_NAME_LENGTH", "0")
 RCLONE_LOG_LEVEL = os.environ.get("RCLONE_LOG_LEVEL", "INFO")
 RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT = os.environ.get("RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT", "1")
+MODAL_MAX_UPLOADS_PER_REMOTE = int(os.environ.get("MODAL_MAX_UPLOADS_PER_REMOTE", "0"))
 MODAL_DISCOVER_THREADS = int(os.environ.get("MODAL_DISCOVER_THREADS", "16"))
 MODAL_DISCOVER_SHARD_DEPTH = int(os.environ.get("MODAL_DISCOVER_SHARD_DEPTH", "1"))
 MODAL_MOUNTED_FIND_THREADS = int(os.environ.get("MODAL_MOUNTED_FIND_THREADS", "16"))
@@ -1622,6 +1623,33 @@ def run_checked(command: str) -> None:
     subprocess.run(command, shell=True, executable="/bin/bash", check=True)
 
 
+class RcloneError(RuntimeError):
+    def __init__(self, message: str, returncode: int) -> None:
+        super().__init__(message)
+        self.returncode = returncode
+
+
+def raise_for_rclone_failure(result: subprocess.CompletedProcess[str], command_label: str) -> None:
+    if result.returncode == 0:
+        return
+    output = "\n".join(part for part in [result.stdout, result.stderr] if part)
+    raise RcloneError(f"{command_label} failed with exit code {result.returncode}\n{output}".strip(), result.returncode)
+
+
+def is_drive_rate_limit_error(exc: Exception) -> bool:
+    message = repr(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "userratelimitexceeded",
+            "user rate limit exceeded",
+            "received upload limit error",
+            "daily upload limit",
+            "upload limit",
+        )
+    )
+
+
 def truthy(value: str) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
@@ -1679,7 +1707,14 @@ def rclone_rcat(remote: str, dest_path: str, local_path: Path) -> None:
     ]
     command.extend(rclone_common_args())
     with local_path.open("rb") as handle:
-        subprocess.run(command, stdin=handle, check=True)
+        result = subprocess.run(command, stdin=handle, text=False, capture_output=True)
+    decoded = subprocess.CompletedProcess(
+        args=result.args,
+        returncode=result.returncode,
+        stdout=result.stdout.decode(errors="replace") if result.stdout else "",
+        stderr=result.stderr.decode(errors="replace") if result.stderr else "",
+    )
+    raise_for_rclone_failure(decoded, f"rclone rcat {remote}:{dest_path}")
 
 
 def rclone_copyto(remote: str, dest_path: str, local_path: Path) -> None:
@@ -1692,7 +1727,8 @@ def rclone_copyto(remote: str, dest_path: str, local_path: Path) -> None:
         f"{remote}:{dest_path}",
     ]
     command.extend(rclone_common_args())
-    subprocess.run(command, check=True)
+    result = subprocess.run(command, text=True, capture_output=True)
+    raise_for_rclone_failure(result, f"rclone copyto {remote}:{dest_path}")
 
 
 def rclone_purge(remote: str, dest_prefix: str, dry_run: bool) -> None:
@@ -1723,7 +1759,8 @@ def upload_archive_stream(unit_abs: Path, remote: str, archive_dest: str, compre
         f"| rclone --config {config} rcat {target} "
         f"{rclone_flags}"
     )
-    run_checked(command)
+    result = subprocess.run(command, shell=True, executable="/bin/bash", text=True, capture_output=True)
+    raise_for_rclone_failure(result, f"stream upload {remote}:{archive_dest}")
 
 
 def create_archive_staged(unit_abs: Path, archive_path: Path, compression_level: int) -> None:
@@ -1957,9 +1994,13 @@ def upload_worker(
     upload_mode: str = "stream",
     max_package_bytes: str = "700GiB",
     warn_package_bytes: str = "650GiB",
+    max_uploads_per_remote: int = MODAL_MAX_UPLOADS_PER_REMOTE,
 ) -> dict[str, Any]:
     rows = load_plan(plan_path)
     remotes = load_remotes(worker_index, remote_group_size)
+    active_remotes = list(remotes)
+    retired_remotes: dict[str, str] = {}
+    remote_upload_counts = {remote: 0 for remote in remotes}
     if upload_mode not in {"stream", "staged"}:
         raise ValueError("upload_mode must be 'stream' or 'staged'")
 
@@ -1978,7 +2019,9 @@ def upload_worker(
             row_index = int(row["index"])
             if row_index % worker_count != worker_index:
                 continue
-            remote = remotes[processed % len(remotes)]
+            if not active_remotes:
+                break
+            remote = active_remotes[processed % len(active_remotes)]
             row_kind = row.get("kind", "package")
             unit_rel = row["source_path"]
             unit_abs = SOURCE_MOUNT / clean_relative_path(unit_rel)
@@ -2010,6 +2053,10 @@ def upload_worker(
                         rclone_copyto(remote, row.get("dest_path", archive_dest), unit_abs)
                         result["status"] = "uploaded"
                         uploaded += 1
+                        remote_upload_counts[remote] += 1
+                        if max_uploads_per_remote > 0 and remote_upload_counts[remote] >= max_uploads_per_remote:
+                            retired_remotes[remote] = f"max_uploads_per_remote={max_uploads_per_remote}"
+                            active_remotes = [candidate for candidate in active_remotes if candidate != remote]
                     status_handle.write(json.dumps(result | {"finished_at_unix": int(time.time())}, sort_keys=True) + "\n")
                     status_handle.flush()
                     processed += 1
@@ -2059,16 +2106,25 @@ def upload_worker(
                             cache_volume.commit()
                             result["status"] = "uploaded"
                             uploaded += 1
+                            remote_upload_counts[remote] += 1
                         else:
                             upload_archive_stream(unit_abs, remote, archive_dest, compression_level)
                             rclone_rcat(remote, package_index_dest, Path(index_info["package_index_path"]))
                             rclone_rcat(remote, files_index_dest, Path(index_info["files_index_path"]))
                             result["status"] = "uploaded"
                             uploaded += 1
+                            remote_upload_counts[remote] += 1
+                        if max_uploads_per_remote > 0 and remote_upload_counts[remote] >= max_uploads_per_remote:
+                            retired_remotes[remote] = f"max_uploads_per_remote={max_uploads_per_remote}"
+                            active_remotes = [candidate for candidate in active_remotes if candidate != remote]
             except Exception as exc:  # noqa: BLE001 - worker status should record any package failure.
                 result["status"] = "failed"
                 result["error"] = repr(exc)
                 failed += 1
+                if is_drive_rate_limit_error(exc):
+                    result["status"] = "remote_rate_limited"
+                    retired_remotes[remote] = "drive_rate_limit"
+                    active_remotes = [candidate for candidate in active_remotes if candidate != remote]
             result["finished_at_unix"] = int(time.time())
             status_handle.write(json.dumps(result, sort_keys=True) + "\n")
             status_handle.flush()
@@ -2081,6 +2137,10 @@ def upload_worker(
         "worker_index": worker_index,
         "worker_count": worker_count,
         "remotes": remotes,
+        "active_remotes": active_remotes,
+        "retired_remotes": retired_remotes,
+        "remote_upload_counts": remote_upload_counts,
+        "max_uploads_per_remote": max_uploads_per_remote,
         "processed": processed,
         "uploaded": uploaded,
         "skipped": skipped,
@@ -2108,6 +2168,7 @@ def main(
     upload_mode: str = os.environ.get("MODAL_UPLOAD_MODE", "stream"),
     max_package_bytes: str = os.environ.get("MODAL_MAX_PACKAGE_BYTES", "700GiB"),
     warn_package_bytes: str = os.environ.get("MODAL_WARN_PACKAGE_BYTES", "650GiB"),
+    max_uploads_per_remote: int = MODAL_MAX_UPLOADS_PER_REMOTE,
     allow_unsafe_delete: bool = False,
 ):
     if command == "discover":
@@ -2192,6 +2253,7 @@ def main(
                 upload_mode=upload_mode,
                 max_package_bytes=max_package_bytes,
                 warn_package_bytes=warn_package_bytes,
+                max_uploads_per_remote=max_uploads_per_remote,
             )
             for index in worker_indexes
         ]

@@ -690,6 +690,7 @@ RCLONE_RETRIES="3"
 RCLONE_LOW_LEVEL_RETRIES="20"
 RCLONE_RETRIES_SLEEP="30s"
 RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT="1"
+MODAL_MAX_UPLOADS_PER_REMOTE="0"
 ```
 
 Operator notes:
@@ -699,6 +700,7 @@ Operator notes:
 - Keep `RCLONE_TRANSFERS=1` for Modal package workers. Concurrency should come from separate workers/service accounts, not multiple huge uploads inside one container.
 - `RCLONE_TPSLIMIT=5` with burst `0` is intentionally conservative. Lower it if Google returns rate-limit errors.
 - Keep `RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT=1`; a worker should stop when Drive reports the daily upload limit.
+- `MODAL_MAX_UPLOADS_PER_REMOTE=0` means no per-remote success cap. Use a small cap for Drive-sensitive tests.
 - Prefer direct rclone operations (`copy`, `copyto`, `rcat`) over rclone mount for migration uploads.
 - The Modal image should install rclone from the official rclone installer, not the Debian package, because distro packages can be old.
 
@@ -772,6 +774,25 @@ MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
   --no-dry-run \
   --limit 1
 ```
+
+If Drive returns `userRateLimitExceeded` or broad upload-limit errors, do not scale by adding more Modal containers. Switch to serial remote rotation first:
+
+```bash
+RCLONE_TPSLIMIT=1 \
+MODAL_MAX_CONTAINERS=1 \
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh upload \
+  --plan-path plans/source-units.jsonl \
+  --worker-count 1 \
+  --worker-index 0 \
+  --remote-group-size 100 \
+  --upload-mode stream \
+  --max-uploads-per-remote 1 \
+  --no-dry-run \
+  --limit 100
+```
+
+In this mode, one worker owns the full plan and rotates across up to 100 service-account remotes. The worker retires a remote from its active rotation when rclone reports a Drive upload/rate-limit response. The returned summary includes `active_remotes`, `retired_remotes`, and `remote_upload_counts`; inspect those before raising `--limit`, `--max-uploads-per-remote`, or worker count.
 
 Verify the package folder with rclone before increasing workers:
 
