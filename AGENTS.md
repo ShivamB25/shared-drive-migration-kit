@@ -803,7 +803,22 @@ cache Modal Volume -> Shared Drive drain, then remove local spool files after su
 
 This is the generic **zip mode** workflow; see `docs/zip-mode.md` for the target-agnostic explanation. In the Modal CLI, `zip`, `zip-mode`, and `prepare-archives` are equivalent archive-spool preparation commands.
 
-Use contiguous assignment for this workflow. The plan is sorted by source path, so contiguous worker slices preserve folder ranges better than modulo assignment.
+Use one inventory-producing planner first when exact sizes are needed. The inventory JSONL should become the source of truth for choosing which top-level folders can be zipped whole and which folders must fall back to lower-level package rows. Use contiguous assignment for zip workers; the plan is sorted by source path, so contiguous worker slices preserve folder ranges better than modulo assignment.
+
+Create a size-based hybrid plan from an existing inventory:
+
+```bash
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  scripts/run_modal_volume_adapter.sh plan-hybrid-inventory \
+  --source-prefix "" \
+  --top-depth 1 \
+  --fallback-depth 2 \
+  --dest-prefix source-volume-name \
+  --plan-path plans/source-hybrid-units.jsonl \
+  --inventory-path plans/source-inventory-seed.inventory.jsonl \
+  --max-package-bytes 700GiB \
+  --warn-package-bytes 650GiB
+```
 
 Prepare a limited archive spool:
 

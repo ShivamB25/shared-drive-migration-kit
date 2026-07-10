@@ -55,6 +55,80 @@ unit="datasets/language/en"
 
 Zip mode should not guess business structure. It should accept a plan produced by discovery or by a custom adapter.
 
+## Hybrid Folder Planning
+
+For very large trees, use inventory-based hybrid planning instead of one fixed depth:
+
+```text
+small top-level folder
+  -> one archive for the whole folder
+
+large top-level folder
+  -> fallback archives for lower-level child folders
+```
+
+This keeps Google Drive item counts low without creating archives that are likely to exceed a target upload limit. The inventory pass is the expensive metadata step; after it exists, planning should reuse it instead of making every zip worker rediscover sizes.
+
+Example:
+
+```text
+aa/
+  70 child folders
+  -> aa.tar.zst
+  -> aa.package.index.json
+  -> aa.files.index.jsonl.zst
+
+en/
+  145525 child folders
+  -> en/<podcast-1>/<podcast-1>.tar.zst
+  -> en/<podcast-2>/<podcast-2>.tar.zst
+```
+
+The inventory planner chooses top-level archives by real byte totals. If a top-level folder is above `--max-package-bytes`, it falls back to lower-level child folders. Workers still compute the final package index before writing an archive and skip any row above `--max-package-bytes`.
+
+Create or reuse a full inventory first. For Modal Volume sources, `discover-mounted-fast` writes a full inventory JSONL next to the plan:
+
+```bash
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+scripts/run_modal_volume_adapter.sh discover-mounted-fast \
+  --source-prefix "" \
+  --unit-depth 2 \
+  --dest-prefix SourceName \
+  --plan-path plans/source-inventory-seed.jsonl \
+  --max-package-bytes 700GiB \
+  --warn-package-bytes 650GiB
+```
+
+Then create a size-based hybrid plan from the inventory:
+
+```bash
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+scripts/run_modal_volume_adapter.sh plan-hybrid-inventory \
+  --source-prefix "" \
+  --top-depth 1 \
+  --fallback-depth 2 \
+  --dest-prefix SourceName \
+  --plan-path plans/source-hybrid-units.jsonl \
+  --inventory-path plans/source-inventory-seed.inventory.jsonl \
+  --max-package-bytes 700GiB \
+  --warn-package-bytes 650GiB
+```
+
+Then zip from the hybrid plan:
+
+```bash
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+MODAL_MAX_CONTAINERS=100 \
+MODAL_CACHE_COMMIT_EVERY=25 \
+modal run --detach adapters/modal_volume/modal_shared_drive_app.py \
+  --command zip \
+  --plan-path plans/source-hybrid-units.jsonl \
+  --worker-count 100 \
+  --assignment-mode contiguous \
+  --spool-name source-hybrid-spool \
+  --no-dry-run
+```
+
 ## Package Layout
 
 Each package produces:
@@ -153,4 +227,3 @@ modal volume ls <cache-volume-name> /archive-spool/<spool-name>
 - Commit cache writes in batches for throughput. Lower `MODAL_CACHE_COMMIT_EVERY` if redoing work after preemption is more expensive than commit overhead.
 - Expect Modal preemption. Workers should skip already prepared files on retry.
 - Start with a limit, inspect cache growth, then scale.
-

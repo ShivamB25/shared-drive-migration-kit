@@ -1112,6 +1112,388 @@ def write_structure_plan_to_state(
     return summary
 
 
+def write_hybrid_structure_plan_to_state(
+    source_volume_name: str,
+    source_prefix: str,
+    top_depth: int,
+    fallback_depth: int,
+    max_children_per_top_unit: int,
+    dest_prefix: str,
+    plan_path: str,
+    max_package_bytes: str,
+    warn_package_bytes: str,
+) -> dict[str, Any]:
+    if top_depth < 1:
+        raise ValueError("top_depth must be >= 1")
+    if fallback_depth <= top_depth:
+        raise ValueError("fallback_depth must be greater than top_depth")
+    volume = modal.Volume.from_name(source_volume_name)
+    state = modal.Volume.from_name(STATE_VOLUME_NAME, create_if_missing=True)
+    max_bytes = parse_bytes(max_package_bytes)
+    warn_bytes = parse_bytes(warn_package_bytes)
+    source = source_prefix.strip("/")
+    remote_plan_path = clean_relative_path(plan_path).as_posix()
+    remote_summary_path = str(Path(remote_plan_path).with_suffix(".summary.json"))
+    started_at = time.time()
+
+    raw_files: list[dict[str, Any]] = []
+    package_units: list[dict[str, Any]] = []
+    top_units = discover_unit_paths_api(volume, source, top_depth, 0)
+    listed_dirs = 1
+
+    if not source and top_depth == 1:
+        for entry in volume.listdir("/", recursive=False):
+            if entry_is_file(entry):
+                entry_path = entry.path.strip("/")
+                raw_files.append(
+                    {
+                        "source_path": entry_path,
+                        "dest_path": raw_dest_path(dest_prefix, entry_path),
+                        "bytes": int(getattr(entry, "size", 0) or 0),
+                        "mtime": str(getattr(entry, "mtime", "")),
+                    }
+                )
+
+    for top_unit in sorted(top_units):
+        child_units = discover_unit_paths_api(volume, top_unit, fallback_depth - top_depth, 0)
+        listed_dirs += 1
+        if len(child_units) <= max_children_per_top_unit:
+            package_units.append(
+                {
+                    "source_path": top_unit,
+                    "hybrid_level": "top",
+                    "child_package_rows": len(child_units),
+                    "package_strategy": "worker_index_required",
+                }
+            )
+        else:
+            for child_unit in sorted(child_units):
+                package_units.append(
+                    {
+                        "source_path": child_unit,
+                        "hybrid_level": "fallback",
+                        "top_source_path": top_unit,
+                        "child_package_rows": 1,
+                        "package_strategy": "worker_index_required",
+                    }
+                )
+
+        if listed_dirs % 50 == 0:
+            elapsed = max(time.time() - started_at, 0.001)
+            print(
+                json.dumps(
+                    {
+                        "planner": "modal-volume-hybrid-structure",
+                        "top_units_seen": listed_dirs - 1,
+                        "package_units": len(package_units),
+                        "top_depth": top_depth,
+                        "fallback_depth": fallback_depth,
+                        "listings_per_second": round(listed_dirs / elapsed, 2),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        local_plan = tmp_path / "plan.jsonl"
+        local_summary = tmp_path / "summary.json"
+
+        rows = 0
+        raw_bytes = 0
+        top_package_rows = 0
+        fallback_package_rows = 0
+        with local_plan.open("w") as plan_handle:
+            for raw_index, raw_file in enumerate(sorted(raw_files, key=lambda item: item["source_path"])):
+                row = {
+                    "index": rows,
+                    "kind": "raw_file",
+                    "source_volume": source_volume_name,
+                    "source_path": raw_file["source_path"],
+                    "dest_path": raw_file["dest_path"],
+                    "archive_dest": raw_file["dest_path"],
+                    "package_format": "raw",
+                    "files": 1,
+                    "directories": 0,
+                    "bytes": raw_file["bytes"],
+                    "planner": "modal-volume-hybrid-structure",
+                    "raw_index": raw_index,
+                }
+                plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+                rows += 1
+                raw_bytes += int(raw_file["bytes"])
+
+            for package_unit in sorted(package_units, key=lambda item: item["source_path"]):
+                unit_path = package_unit["source_path"]
+                archive_dest, package_index_dest, files_index_dest = target_paths(dest_prefix, unit_path)
+                hybrid_level = package_unit["hybrid_level"]
+                if hybrid_level == "top":
+                    top_package_rows += 1
+                else:
+                    fallback_package_rows += 1
+                row = {
+                    "index": rows,
+                    "kind": "package",
+                    "source_volume": source_volume_name,
+                    "source_path": unit_path,
+                    "archive_dest": archive_dest,
+                    "package_index_dest": package_index_dest,
+                    "files_index_dest": files_index_dest,
+                    "package_format": "tar.zst",
+                    "files": None,
+                    "directories": None,
+                    "bytes": None,
+                    "package_strategy": package_unit["package_strategy"],
+                    "max_package_bytes": max_bytes,
+                    "warn_package_bytes": warn_bytes,
+                    "planner": "modal-volume-hybrid-structure",
+                    "hybrid_level": hybrid_level,
+                    "top_source_path": package_unit.get("top_source_path", unit_path),
+                    "child_package_rows": package_unit["child_package_rows"],
+                }
+                plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+                rows += 1
+
+        summary = {
+            "source_volume": source_volume_name,
+            "source_prefix": source_prefix,
+            "top_depth": top_depth,
+            "fallback_depth": fallback_depth,
+            "max_children_per_top_unit": max_children_per_top_unit,
+            "dest_prefix": dest_prefix,
+            "plan_path": f"/state/{remote_plan_path}",
+            "summary_path": f"/state/{remote_summary_path}",
+            "planner": "modal-volume-hybrid-structure",
+            "listed_dirs": listed_dirs,
+            "top_units": len(top_units),
+            "top_package_rows": top_package_rows,
+            "fallback_package_rows": fallback_package_rows,
+            "package_rows": len(package_units),
+            "raw_file_rows": len(raw_files),
+            "raw_bytes": raw_bytes,
+            "plan_rows": rows,
+            "estimated_drive_items": (len(package_units) * 3) + len(raw_files),
+            "max_package_bytes": max_bytes,
+            "warn_package_bytes": warn_bytes,
+            "elapsed_seconds": round(time.time() - started_at, 3),
+            "note": "Top-level packages are chosen by child count. Workers still compute indexes and skip packages above max_package_bytes.",
+        }
+        local_summary.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+
+        with state.batch_upload(force=True) as batch:
+            batch.put_file(local_plan, remote_plan_path)
+            batch.put_file(local_summary, remote_summary_path)
+
+    return summary
+
+
+@app.function(
+    image=image,
+    volumes={str(STATE_MOUNT): state_volume},
+    timeout=env_int("MODAL_TIMEOUT", 43200),
+    cpu=float(os.environ.get("MODAL_CPU", "2")),
+    memory=env_int("MODAL_MEMORY", 4096),
+    ephemeral_disk=env_int("MODAL_EPHEMERAL_DISK", 524288),
+    max_containers=1,
+)
+def write_hybrid_inventory_plan(
+    source_volume_name: str,
+    source_prefix: str,
+    top_depth: int,
+    fallback_depth: int,
+    dest_prefix: str,
+    plan_path: str,
+    inventory_path: str = "",
+    max_package_bytes: str = "700GiB",
+    warn_package_bytes: str = "650GiB",
+) -> dict[str, Any]:
+    if top_depth < 1:
+        raise ValueError("top_depth must be >= 1")
+    if fallback_depth <= top_depth:
+        raise ValueError("fallback_depth must be greater than top_depth")
+
+    max_bytes = parse_bytes(max_package_bytes)
+    warn_bytes = parse_bytes(warn_package_bytes)
+    source = source_prefix.strip("/")
+    remote_plan_path = clean_relative_path(plan_path).as_posix()
+    remote_summary_path = str(Path(remote_plan_path).with_suffix(".summary.json"))
+    remote_inventory_path = clean_relative_path(inventory_path or inventory_path_for_plan(plan_path)).as_posix()
+    inventory = STATE_MOUNT / remote_inventory_path
+    output = STATE_MOUNT / remote_plan_path
+    summary_path = STATE_MOUNT / remote_summary_path
+    if not inventory.exists():
+        raise FileNotFoundError(f"missing inventory: {inventory}")
+
+    top_units: dict[str, dict[str, int]] = {}
+    fallback_units: dict[str, dict[str, Any]] = {}
+    raw_files: list[dict[str, Any]] = []
+    entries = 0
+    files = 0
+    directories = 0
+    bytes_total = 0
+    started_at = time.time()
+
+    with inventory.open() as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            source_path = str(record.get("path", "")).strip("/")
+            relative_path = str(record.get("relative_path") or relative_path_under_prefix(source_path, source))
+            kind_name = str(record.get("type", "")).upper()
+            is_file = kind_name.endswith("FILE") or kind_name == "F"
+            is_dir = kind_name.endswith("DIRECTORY") or kind_name == "D"
+            size = int(record.get("size", 0) or 0) if is_file else 0
+            top_unit = aggregate_unit_path(source, relative_path, top_depth)
+            fallback_unit = aggregate_unit_path(source, relative_path, fallback_depth)
+
+            entries += 1
+            if is_file:
+                files += 1
+                bytes_total += size
+            elif is_dir:
+                directories += 1
+
+            if top_unit is None:
+                if is_file:
+                    raw_files.append(
+                        {
+                            "source_path": source_path,
+                            "dest_path": raw_dest_path(dest_prefix, source_path),
+                            "bytes": size,
+                            "mtime": str(record.get("mtime", "")),
+                        }
+                    )
+                continue
+
+            top_stats = top_units.setdefault(top_unit, {"files": 0, "directories": 0, "bytes": 0})
+            if is_file:
+                top_stats["files"] += 1
+                top_stats["bytes"] += size
+            elif is_dir and source_path != top_unit:
+                top_stats["directories"] += 1
+
+            if fallback_unit is not None:
+                fallback_stats = fallback_units.setdefault(
+                    fallback_unit,
+                    {"files": 0, "directories": 0, "bytes": 0, "top_source_path": top_unit},
+                )
+                if is_file:
+                    fallback_stats["files"] += 1
+                    fallback_stats["bytes"] += size
+                elif is_dir and source_path != fallback_unit:
+                    fallback_stats["directories"] += 1
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = 0
+    raw_bytes = 0
+    top_package_rows = 0
+    fallback_package_rows = 0
+    split_required_rows = 0
+    strategy_counts: dict[str, int] = {}
+
+    with output.open("w") as plan_handle:
+        for raw_index, raw_file in enumerate(sorted(raw_files, key=lambda item: item["source_path"])):
+            row = {
+                "index": rows,
+                "kind": "raw_file",
+                "source_volume": source_volume_name,
+                "source_path": raw_file["source_path"],
+                "dest_path": raw_file["dest_path"],
+                "archive_dest": raw_file["dest_path"],
+                "package_format": "raw",
+                "files": 1,
+                "directories": 0,
+                "bytes": raw_file["bytes"],
+                "planner": "modal-volume-hybrid-inventory",
+                "raw_index": raw_index,
+            }
+            plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+            rows += 1
+            raw_bytes += int(raw_file["bytes"])
+
+        for top_unit in sorted(top_units):
+            top_stats = top_units[top_unit]
+            selected_units: list[tuple[str, dict[str, Any], str]]
+            if int(top_stats["bytes"]) <= max_bytes:
+                selected_units = [(top_unit, top_stats, "top")]
+            else:
+                selected_units = [
+                    (unit_path, unit_stats, "fallback")
+                    for unit_path, unit_stats in sorted(fallback_units.items())
+                    if unit_stats.get("top_source_path") == top_unit
+                ]
+
+            for unit_path, unit_stats, hybrid_level in selected_units:
+                unit_bytes = int(unit_stats["bytes"])
+                strategy = package_strategy(unit_bytes, max_bytes, warn_bytes)
+                if strategy == "split_required":
+                    split_required_rows += 1
+                if hybrid_level == "top":
+                    top_package_rows += 1
+                else:
+                    fallback_package_rows += 1
+                strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
+                archive_dest, package_index_dest, files_index_dest = target_paths(dest_prefix, unit_path)
+                row = {
+                    "index": rows,
+                    "kind": "package",
+                    "source_volume": source_volume_name,
+                    "source_path": unit_path,
+                    "archive_dest": archive_dest,
+                    "package_index_dest": package_index_dest,
+                    "files_index_dest": files_index_dest,
+                    "package_format": "tar.zst",
+                    "files": int(unit_stats["files"]),
+                    "directories": int(unit_stats["directories"]),
+                    "bytes": unit_bytes,
+                    "package_strategy": strategy,
+                    "max_package_bytes": max_bytes,
+                    "warn_package_bytes": warn_bytes,
+                    "planner": "modal-volume-hybrid-inventory",
+                    "hybrid_level": hybrid_level,
+                    "top_source_path": unit_stats.get("top_source_path", unit_path),
+                }
+                plan_handle.write(json.dumps(row, sort_keys=True) + "\n")
+                rows += 1
+
+    summary = {
+        "source_volume": source_volume_name,
+        "source_prefix": source_prefix,
+        "top_depth": top_depth,
+        "fallback_depth": fallback_depth,
+        "dest_prefix": dest_prefix,
+        "plan_path": f"/state/{remote_plan_path}",
+        "summary_path": f"/state/{remote_summary_path}",
+        "inventory_path": f"/state/{remote_inventory_path}",
+        "planner": "modal-volume-hybrid-inventory",
+        "entries": entries,
+        "files": files,
+        "directories": directories,
+        "bytes": bytes_total,
+        "top_units": len(top_units),
+        "top_package_rows": top_package_rows,
+        "fallback_package_rows": fallback_package_rows,
+        "split_required_rows": split_required_rows,
+        "package_rows": top_package_rows + fallback_package_rows,
+        "raw_file_rows": len(raw_files),
+        "raw_bytes": raw_bytes,
+        "plan_rows": rows,
+        "estimated_drive_items": ((top_package_rows + fallback_package_rows) * 3) + len(raw_files),
+        "max_package_bytes": max_bytes,
+        "warn_package_bytes": warn_bytes,
+        "strategy_counts": strategy_counts,
+        "elapsed_seconds": round(time.time() - started_at, 3),
+        "note": "Top-level packages are selected by real inventory bytes. Oversized top units fall back to lower-level units.",
+    }
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    state_volume.commit()
+    return summary
+
+
 def iter_find_records(find_root: Path) -> Iterator[tuple[str, int, str, str]]:
     command = ["find", str(find_root), "-mindepth", "1", "-printf", "%y\\0%s\\0%T@\\0%P\\0"]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -2497,8 +2879,12 @@ def main(
     command: str = "discover",
     source_prefix: str = "",
     unit_depth: int = 2,
+    top_depth: int = 1,
+    fallback_depth: int = 2,
+    max_children_per_top_unit: int = env_int("MODAL_MAX_CHILDREN_PER_TOP_UNIT", 1000),
     dest_prefix: str = "",
     plan_path: str = "plans/modal-volume-units.jsonl",
+    inventory_path: str = "",
     worker_count: int = 10,
     remote_group_size: int = 10,
     assignment_mode: str = os.environ.get("MODAL_ASSIGNMENT_MODE", "contiguous"),
@@ -2577,6 +2963,36 @@ def main(
             unit_depth=unit_depth,
             dest_prefix=dest_prefix,
             plan_path=plan_path,
+            max_package_bytes=max_package_bytes,
+            warn_package_bytes=warn_package_bytes,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+
+    if command in {"discover-hybrid-structure", "discover-hybrid", "plan-hybrid"}:
+        result = write_hybrid_structure_plan_to_state(
+            source_volume_name=SOURCE_VOLUME_NAME,
+            source_prefix=source_prefix,
+            top_depth=top_depth,
+            fallback_depth=fallback_depth,
+            max_children_per_top_unit=max_children_per_top_unit,
+            dest_prefix=dest_prefix,
+            plan_path=plan_path,
+            max_package_bytes=max_package_bytes,
+            warn_package_bytes=warn_package_bytes,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+
+    if command in {"discover-hybrid-inventory", "plan-hybrid-inventory"}:
+        result = write_hybrid_inventory_plan.remote(
+            source_volume_name=SOURCE_VOLUME_NAME,
+            source_prefix=source_prefix,
+            top_depth=top_depth,
+            fallback_depth=fallback_depth,
+            dest_prefix=dest_prefix,
+            plan_path=plan_path,
+            inventory_path=inventory_path,
             max_package_bytes=max_package_bytes,
             warn_package_bytes=warn_package_bytes,
         )

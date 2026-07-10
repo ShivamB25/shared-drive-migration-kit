@@ -783,6 +783,8 @@ For very large source volumes, prefer a two-phase archive spool when Drive is un
 
 This is the generic **zip mode** workflow. See [docs/zip-mode.md](docs/zip-mode.md) for the target-agnostic version. In the Modal CLI, `zip`, `zip-mode`, and `prepare-archives` all prepare the same cache spool.
 
+When exact source sizes are needed, run one inventory-producing planner first and create a size-based hybrid plan with `plan-hybrid-inventory`. That plan can zip small top-level folders whole and fall back to lower-level package rows only for folders above `--max-package-bytes`.
+
 The source volume remains read-only. The cache volume must have enough capacity for the prepared archives. For a 72 TiB source, this can require tens of TiB of Modal Volume storage even with zstd compression, so start with small limits and inspect `/state/runs/prepare-worker-...` before scaling.
 
 `MODAL_CACHE_COMMIT_EVERY` controls how often prepared files are committed to the cache volume. Larger values reduce Modal Volume commit overhead and are faster; smaller values reduce the amount of work that may need to be repeated if a worker is interrupted before its next commit.
