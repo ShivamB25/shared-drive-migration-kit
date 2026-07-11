@@ -55,7 +55,7 @@ unit="datasets/language/en"
 
 Zip mode should not guess business structure. It should accept a plan produced by discovery or by a custom adapter.
 
-## Hybrid Folder Planning
+## Sane Folder Planning
 
 For very large trees, use inventory-based hybrid planning instead of one fixed depth:
 
@@ -64,7 +64,8 @@ small top-level folder
   -> one archive for the whole folder
 
 large top-level folder
-  -> fallback archives for lower-level child folders
+  -> contiguous batches of complete child folders
+  -> recurse only when one child is itself too large
 ```
 
 This keeps Google Drive item counts low without creating archives that are likely to exceed a target upload limit. The inventory pass is the expensive metadata step; after it exists, planning should reuse it instead of making every zip worker rediscover sizes.
@@ -80,63 +81,78 @@ aa/
 
 en/
   145525 child folders
-  -> en/<podcast-1>/<podcast-1>.tar.zst
-  -> en/<podcast-2>/<podcast-2>.tar.zst
+  -> en/batches/en-batch-00001.tar.zst
+  -> en/batches/en-batch-00002.tar.zst
 ```
 
-The inventory planner chooses top-level archives by real byte totals. If a top-level folder is above `--max-package-bytes`, it falls back to lower-level child folders. Workers still compute the final package index before writing an archive and skip any row above `--max-package-bytes`.
+Every batch contains complete, path-contiguous child folders and is independently extractable. The planner limits source bytes, archive entries, and source roots at the same time. It never uses multipart tar for ordinary folders. Original paths are stored relative to the Modal Volume root, so extracting at a restore root recreates paths such as `en/<podcast>/...`.
 
-Create or reuse a full inventory first. For Modal Volume sources, `discover-mounted-fast` writes a full inventory JSONL next to the plan:
+Create or reuse a full inventory first. Modal does not expose recursive folder sizes for package planning: `modal volume ls --json` and `Volume.listdir()` both report directories as `0 B`, while direct file entries have real sizes. `find-json-fast` writes resumable JSONL shards plus a compatibility JSON array; the sane planner streams the shards directly.
 
 ```bash
 MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
-scripts/run_modal_volume_adapter.sh discover-mounted-fast \
+modal run adapters/modal_volume/modal_shared_drive_app.py \
+  --command find-json-fast \
   --source-prefix "" \
-  --unit-depth 2 \
-  --dest-prefix SourceName \
-  --plan-path plans/source-inventory-seed.jsonl \
-  --max-package-bytes 700GiB \
-  --warn-package-bytes 650GiB
+  --plan-path plans/source-find-fast.json \
+  --worker-count 32
 ```
 
-Then create a size-based hybrid plan from the inventory:
+Then create the sane package plan from the completed `find-json-fast` inventory:
 
 ```bash
 MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
-scripts/run_modal_volume_adapter.sh plan-hybrid-inventory \
+modal run adapters/modal_volume/modal_shared_drive_app.py \
+  --command plan-sane-archives \
   --source-prefix "" \
-  --top-depth 1 \
-  --fallback-depth 2 \
   --dest-prefix SourceName \
-  --plan-path plans/source-hybrid-units.jsonl \
-  --inventory-path plans/source-inventory-seed.inventory.jsonl \
-  --max-package-bytes 700GiB \
-  --warn-package-bytes 650GiB
+  --inventory-path plans/source-find-fast.json \
+  --plan-path plans/source-sane-archives.jsonl \
+  --max-package-bytes 200GiB \
+  --max-archive-entries 100000 \
+  --max-roots-per-archive 1000 \
+  --shared-drive-item-limit 400000
 ```
 
-Then zip from the hybrid plan:
+This command is a planning dry run. It reads inventory shards and writes only the plan and summary to the Modal state volume. Require `plan_complete=true`, `fits_shared_drive_item_limit=true`, zero oversized files, and exact source/package byte coverage before preparing archives.
+
+Then zip from the sane plan:
 
 ```bash
 MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
-MODAL_MAX_CONTAINERS=100 \
+MODAL_MAX_CONTAINERS=10 \
 MODAL_CACHE_COMMIT_EVERY=25 \
 modal run --detach adapters/modal_volume/modal_shared_drive_app.py \
   --command zip \
-  --plan-path plans/source-hybrid-units.jsonl \
-  --worker-count 100 \
+  --plan-path plans/source-sane-archives.jsonl \
+  --worker-count 10 \
   --assignment-mode contiguous \
-  --spool-name source-hybrid-spool \
+  --spool-name source-sane-spool \
   --no-dry-run
 ```
 
 ## Package Layout
 
-Each package produces:
+Each whole-top package produces:
 
 ```text
 <unit>/<unit-name>.tar.zst
 <unit>/<unit-name>.package.index.json
 <unit>/<unit-name>.files.index.jsonl.zst
+```
+
+An oversized top-level folder uses adjacent batch files without creating one Drive folder per source child:
+
+```text
+<top>/batches/<top>-batch-00001.tar.zst
+<top>/batches/<top>-batch-00001.package.index.json
+<top>/batches/<top>-batch-00001.files.index.jsonl.zst
+```
+
+The package index uses `source.paths` for multi-root batches and records the archive SHA-256 after staged creation. Extract any package independently:
+
+```bash
+tar --zstd -xf en-batch-00001.tar.zst -C /restore-root
 ```
 
 The package index records source and package paths:
@@ -146,7 +162,8 @@ The package index records source and package paths:
   "source": {
     "adapter": "modal-volume",
     "volume": "source-volume-name",
-    "path": "aa/62563-Psychiatry-Psychotherapy-Podcast"
+    "path": "aa/62563-Psychiatry-Psychotherapy-Podcast",
+    "paths": ["aa/62563-Psychiatry-Psychotherapy-Podcast"]
   },
   "package": {
     "format": "tar.zst",
@@ -157,18 +174,12 @@ The package index records source and package paths:
 }
 ```
 
-The files index records simple paths relative to the package root:
+The files index records paths relative to the Modal Volume root:
 
 ```json
-{"path":"audio","type":"directory","size":0}
-{"path":"feed.xml","type":"file","size":253422}
-{"path":"audio/example.mp3","type":"file","size":58308836}
-```
-
-The full logical source path is:
-
-```text
-<source.path>/<entry.path>
+{"path":"aa/62563-Psychiatry-Psychotherapy-Podcast/audio","type":"directory","size":0}
+{"path":"aa/62563-Psychiatry-Psychotherapy-Podcast/feed.xml","type":"file","size":253422}
+{"path":"aa/62563-Psychiatry-Psychotherapy-Podcast/audio/example.mp3","type":"file","size":58308836}
 ```
 
 Do not write absolute paths like `/src/...` into indexes. Relative paths keep the package portable.
@@ -186,8 +197,8 @@ scripts/run_modal_volume_adapter.sh zip \
   --worker-count 10 \
   --assignment-mode contiguous \
   --spool-name source-spool \
-  --max-package-bytes 700GiB \
-  --warn-package-bytes 650GiB \
+  --max-package-bytes 200GiB \
+  --warn-package-bytes 180GiB \
   --no-dry-run \
   --limit 1000
 ```
@@ -196,16 +207,16 @@ Full run after checking cache growth and status files:
 
 ```bash
 MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
-MODAL_MAX_CONTAINERS=100 \
+MODAL_MAX_CONTAINERS=10 \
 MODAL_CACHE_COMMIT_EVERY=25 \
 modal run --detach adapters/modal_volume/modal_shared_drive_app.py \
   --command zip \
   --plan-path plans/source-units.jsonl \
-  --worker-count 100 \
+  --worker-count 10 \
   --assignment-mode contiguous \
   --spool-name source-spool \
-  --max-package-bytes 700GiB \
-  --warn-package-bytes 650GiB \
+  --max-package-bytes 200GiB \
+  --warn-package-bytes 180GiB \
   --no-dry-run
 ```
 
@@ -222,6 +233,11 @@ modal volume ls <cache-volume-name> /archive-spool/<spool-name>
 - Separate archive creation from final upload when the final target has rate limits.
 - Keep source volumes read-only.
 - Use a cache/spool volume as the durable handoff point.
+- Start `staged` packages at `200GiB` maximum on Modal's usual 512 GiB ephemeral disk. Source reads/FUSE cache and the archive share that local disk; increase package or worker-disk limits only after a representative measurement.
+- Start with a small number of workers. More containers do not guarantee faster Volume reads or Drive uploads, and many concurrent archive finalizations can trigger target-side pacing.
+- Treat archive, package index, and file index as one completion unit. Audit all three before deleting a spool object or marking a source path complete.
+
+For reusable source/target adapter rules and the pure-Python helper module, see [operational learnings](operational-learnings.md).
 - Use contiguous worker assignment when plan rows are sorted by source path.
 - Keep indexes relative and portable.
 - Commit cache writes in batches for throughput. Lower `MODAL_CACHE_COMMIT_EVERY` if redoing work after preemption is more expensive than commit overhead.

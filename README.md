@@ -629,10 +629,12 @@ RCLONE_TRANSFERS="1"
 RCLONE_CHECKERS="4"
 RCLONE_TPSLIMIT="5"
 RCLONE_TPSLIMIT_BURST="0"
-RCLONE_RETRIES="3"
+RCLONE_RETRIES="10"
 RCLONE_LOW_LEVEL_RETRIES="20"
 RCLONE_RETRIES_SLEEP="30s"
-RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT="1"
+RCLONE_RATE_LIMIT_RETRIES="6"
+RCLONE_RATE_LIMIT_BACKOFF_SECONDS="15"
+RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT="0"
 MODAL_MAX_UPLOADS_PER_REMOTE="0"
 ```
 
@@ -642,7 +644,8 @@ Reasoning:
 - Each Modal worker uploads one package at a time, so `RCLONE_TRANSFERS=1` keeps memory predictable while still allowing concurrency across workers and service accounts.
 - `512M` is the default package-upload chunk size. Try `1G` only after confirming container memory and network behavior.
 - `RCLONE_TPSLIMIT=5` and burst `0` reduce API spikes. Lower this to `2` or `3` if Drive returns rate-limit errors.
-- `--drive-stop-on-upload-limit` makes Google's daily upload-limit response fatal instead of repeatedly wasting time on a package that cannot complete that day.
+- Keep `RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT=0` for resumable package workers. `userRateLimitExceeded` is a transient Drive pacing response and should use rclone backoff/retries; `MODAL_MAX_BYTES_PER_REMOTE` provides the daily-account guard instead.
+- A staged archive remains in cache while `RCLONE_RATE_LIMIT_RETRIES` applies capped exponential backoff to archive/index upload operations. This prevents a transient 403 from causing cache buildup behind a failed package.
 - `MODAL_MAX_UPLOADS_PER_REMOTE=0` means unlimited successful packages per service-account remote. Set it to a small number when testing Drive behavior.
 - Use direct rclone commands (`copy`, `copyto`, or `rcat`) for migration uploads. Avoid uploading through an rclone mount for this workflow.
 
@@ -703,8 +706,8 @@ MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
   --worker-index 0 \
   --remote-group-size 10 \
   --upload-mode staged \
-  --max-package-bytes 700GiB \
-  --warn-package-bytes 650GiB \
+  --max-package-bytes 200GiB \
+  --warn-package-bytes 180GiB \
   --dry-run \
   --limit 1
 ```
@@ -719,8 +722,8 @@ MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
   --worker-index 0 \
   --remote-group-size 10 \
   --upload-mode staged \
-  --max-package-bytes 700GiB \
-  --warn-package-bytes 650GiB \
+  --max-package-bytes 200GiB \
+  --warn-package-bytes 180GiB \
   --no-dry-run \
   --limit 1
 ```
@@ -766,13 +769,13 @@ MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
   --worker-count 1 \
   --worker-index 0 \
   --remote-group-size 100 \
-  --upload-mode stream \
+  --upload-mode staged \
   --max-uploads-per-remote 1 \
   --no-dry-run \
   --limit 100
 ```
 
-In this mode, one Modal container processes all plan rows, rotates across up to 100 remotes, and retires a remote when rclone reports a Drive upload/rate-limit error such as `userRateLimitExceeded`. `--limit` caps total package attempts for the run; `--max-uploads-per-remote` caps successful packages per service account. Raise both only after checking the worker status JSONL under `/state/runs/worker-000/...`.
+In this mode, one Modal container processes all plan rows and rotates across up to 100 remotes. A transient `userRateLimitExceeded` retries the same staged archive with bounded backoff; a remote is retired only after the retry budget is exhausted or an explicit local account cap is reached. `--limit` caps package attempts; raise it only after checking the worker status JSONL under `/state/runs/worker-000/...`.
 
 For very large source volumes, prefer a two-phase archive spool when Drive is unstable:
 
@@ -783,9 +786,24 @@ For very large source volumes, prefer a two-phase archive spool when Drive is un
 
 This is the generic **zip mode** workflow. See [docs/zip-mode.md](docs/zip-mode.md) for the target-agnostic version. In the Modal CLI, `zip`, `zip-mode`, and `prepare-archives` all prepare the same cache spool.
 
-When exact source sizes are needed, run one inventory-producing planner first and create a size-based hybrid plan with `plan-hybrid-inventory`. That plan can zip small top-level folders whole and fall back to lower-level package rows only for folders above `--max-package-bytes`.
+When exact source sizes are needed, run `find-json-fast` once and create a package plan with `plan-sane-archives`. Small top-level folders stay whole. Oversized folders recurse and are packed into contiguous batches of complete child folders. Every batch is an independently extractable `tar.zst`; normal planning never relies on multipart tar.
 
-The source volume remains read-only. The cache volume must have enough capacity for the prepared archives. For a 72 TiB source, this can require tens of TiB of Modal Volume storage even with zstd compression, so start with small limits and inspect `/state/runs/prepare-worker-...` before scaling.
+```bash
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+modal run adapters/modal_volume/modal_shared_drive_app.py \
+  --command plan-sane-archives \
+  --inventory-path plans/source-find-fast.json \
+  --plan-path plans/source-sane-archives.jsonl \
+  --dest-prefix SourceName \
+  --max-package-bytes 200GiB \
+  --max-archive-entries 100000 \
+  --max-roots-per-archive 1000 \
+  --shared-drive-item-limit 400000
+```
+
+This is a read-only source planning run. It writes only the plan and compact summary to the Modal state volume. Continue only when `plan_complete` and `fits_shared_drive_item_limit` are true and `unpackaged_oversized_file_count` is zero.
+
+The source volume remains read-only. The cache volume must have enough capacity for the prepared archives. A source measured in tens of TiB can require many TiB of Modal Volume storage even with zstd compression, so start with small limits and inspect `/state/runs/prepare-worker-...` before scaling.
 
 `MODAL_CACHE_COMMIT_EVERY` controls how often prepared files are committed to the cache volume. Larger values reduce Modal Volume commit overhead and are faster; smaller values reduce the amount of work that may need to be repeated if a worker is interrupted before its next commit.
 
@@ -800,8 +818,8 @@ MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
   --worker-count 10 \
   --assignment-mode contiguous \
   --spool-name source-units-spool \
-  --max-package-bytes 700GiB \
-  --warn-package-bytes 650GiB \
+  --max-package-bytes 200GiB \
+  --warn-package-bytes 180GiB \
   --no-dry-run \
   --limit 100
 ```
@@ -843,7 +861,15 @@ MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
 
 `upload-prepared` copies the archive and index files to Drive, then removes the local spool files only after all files for that package have uploaded successfully. This is safer than per-file `moveto`, which can orphan an archive if an index upload fails.
 
-Modal Volume size note: `modal volume ls --json` exposes direct file sizes, but directories report `0 B`; Modal's dashboard exposes whole-volume size, not recursive package-unit size. The adapter therefore uses the Modal SDK recursive listing API to calculate package-unit size from file metadata. Real uploads also calculate the package index before archiving and skip units larger than `--max-package-bytes`.
+Modal Volume size note: `modal volume ls --json` exposes direct file sizes, but directories report `0 B`; Modal's dashboard exposes whole-volume size, not recursive package-unit size. A one-container `inspect-metadata` probe confirmed `Volume.listdir()` directory entries also expose `size=0`, even with recursive listing. `modal shell --volume ... -c 'du -sh ...'` can compute a folder size by walking the mounted files, but that is computed work, not stored metadata. The adapter therefore calculates package-unit size by summing file-entry sizes from metadata. Real uploads also calculate the package index before archiving and skip units larger than `--max-package-bytes`.
+
+```bash
+MODAL_SOURCE_VOLUME_NAME="source-volume-name" \
+  modal run adapters/modal_volume/modal_shared_drive_app.py \
+  --command inspect-metadata \
+  --source-prefix "/,aa,aa/example-unit" \
+  --limit 8
+```
 
 Package naming:
 
@@ -853,11 +879,11 @@ Package naming:
 <unit>/<unit>.files.index.jsonl.zst
 ```
 
-Size guards:
+Size guards for Modal's usual 512 GiB ephemeral disk in `staged` mode:
 
 ```bash
---max-package-bytes 700GiB
---warn-package-bytes 650GiB
+--max-package-bytes 200GiB
+--warn-package-bytes 180GiB
 ```
 
 Upload modes:
@@ -870,7 +896,13 @@ staged
   /src -> /cache/workers/<worker>/...tar.zst -> rclone copyto
 ```
 
-`staged` mode uses `MODAL_CACHE_VOLUME_NAME`, default `sdmig-cache`, and writes worker-specific paths under `/cache/workers/000`, `/cache/workers/001`, etc. The source volume remains read-only.
+`staged` mode uses `MODAL_CACHE_VOLUME_NAME`, default `sdmig-cache`, and writes worker-specific paths under `/cache/workers/000`, `/cache/workers/001`, etc. The source volume remains read-only. A staged worker holds source-read/FUSE cache and the archive on local worker disk, so do not raise the package guard without testing peak disk use and increasing `MODAL_EPHEMERAL_DISK` when needed.
+
+## Reusable Migration Core
+
+[`migration_core/`](migration_core/) is the source-independent layer used by the Modal adapter. It contains safe-path and byte parsing, deterministic contiguous package planning, worker assignment, package-triplet naming, and bounded retry primitives. New source adapters should import these helpers rather than duplicating migration mechanics.
+
+Read [operational learnings](docs/operational-learnings.md) before adapting the workflow to another provider. It records the package-triplet completion invariant, inventory-first planning, staged-disk sizing, Drive pacing behavior, and recovery rules without relying on this repository's private migration state.
 
 ## Script Reference
 
